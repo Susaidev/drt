@@ -50,6 +50,7 @@ from drt.config.destinations_saas import (
     SalesforceBulkDestinationConfig,
     SendGridDestinationConfig,
     SlackDestinationConfig,
+    SQSDestinationConfig,
     StagedUploadDestinationConfig,
     TeamsDestinationConfig,
     TwilioDestinationConfig,
@@ -781,6 +782,7 @@ def _destination_tag(value: Any) -> str | None:
 DestinationConfig = Annotated[
     Annotated[RestApiDestinationConfig, Tag("rest_api")]
     | Annotated[SlackDestinationConfig, Tag("slack")]
+    | Annotated[SQSDestinationConfig, Tag("sqs")]
     | Annotated[DiscordDestinationConfig, Tag("discord")]
     | Annotated[GitHubActionsDestinationConfig, Tag("github_actions")]
     | Annotated[HubSpotDestinationConfig, Tag("hubspot")]
