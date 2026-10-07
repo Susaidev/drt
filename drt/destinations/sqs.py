@@ -11,10 +11,14 @@ from drt.config.credentials import resolve_env
 from drt.config.models import DestinationConfig, SQSDestinationConfig, SyncOptions
 from drt.destinations.base import SyncResult
 from drt.destinations.rate_limiter import RateLimiterBackend, resolve_rate_limiter
+from drt.destinations.retry import with_retry
 from drt.destinations.row_errors import record_preview, record_row_error
 
 _MAX_ENTRIES = 10
 _MAX_PAYLOAD_BYTES = 1_048_576
+
+class _TransientBatchError(Exception):
+    """Signal that the pending entries need another bounded attempt."""
 
 class SQSDestination:
     def load(
@@ -126,4 +130,44 @@ class SQSDestination:
         sync_options: SyncOptions,
         limiter: RateLimiterBackend,
     ) -> None:
-        pass
+        pending = {entry["Id"]: entry for entry in entries}
+        last_errors: dict[str, str] = {}
+
+        def fail_entry(id_: str, message: str) -> None:
+            index = int(id_)
+            record_row_error(result, index, record_preview(records[index]), ValueError(message))
+            result.errors.append(message)
+            del pending[id_]
+        
+        def send_pending() -> None:
+            limiter.acquire()
+            response = client.send_message_batch(QueueUrl=queue_url, Entries=list(pending.values))
+            successes = response.get("Successful", [])
+            failures = response.get("Failed", [])
+            reported = [entry["Id"] for entry in successes + failures]
+            if len(reported) != len(pending) or set(reported) != set(pending):
+                raise RuntimeError("SQS batch response did not report each requested entry once.")
+            for success in successes:
+                del pending[success["Id"]]
+                result.success += 1
+            for failure in failures:
+                id_ = failure["Id"]
+                message = f"SQS {failure['Code']}: {failure.get('Message', '')}"
+                if failure.get("SenderFault") is True:
+                    fail_entry(id_, message)
+                elif failure.get("SenderFault") is False:
+                    last_errors[id_] = message
+                else:
+                    raise RuntimeError("SQS batch response is missing a boolean SenderFault.")
+            if pending:
+                raise _TransientBatchError("SQS batch has transiently failed entries.")
+
+        try:
+            with_retry(
+                send_pending,
+                sync_options.retry,
+                retry_on=lambda exc: isinstance(exc, _TransientBatchError),
+            )
+        except _TransientBatchError:
+            for id_ in list(pending):
+                fail_entry(id_, last_errors[id_])
