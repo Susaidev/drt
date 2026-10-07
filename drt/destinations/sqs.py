@@ -10,7 +10,11 @@ from uuid import UUID
 from drt.config.credentials import resolve_env
 from drt.config.models import DestinationConfig, SQSDestinationConfig, SyncOptions
 from drt.destinations.base import SyncResult
+from drt.destinations.rate_limiter import RateLimiterBackend, resolve_rate_limiter
+from drt.destinations.row_errors import record_preview, record_row_error
 
+_MAX_ENTRIES = 10
+_MAX_PAYLOAD_BYTES = 1_048_576
 
 class SQSDestination:
     def load(
@@ -42,7 +46,42 @@ class SQSDestination:
                         f"SQS {field} is invalid for a standard queue; "
                         "this field requires a FIFO queue URL ending in .fifo."
                     )
-        
+
+        client = self._client(config)
+        limiter = resolve_rate_limiter(config, sync_options)
+        result = SyncResult()
+        entries: list[dict[str, str]] = []
+        payload_bytes = 0
+        for index, record in enumerate(records):
+            try:
+                entry = self._entry(index, record, config)
+                size = len(entry["MessageBody"].encode("utf-8"))
+                if size > _MAX_PAYLOAD_BYTES:
+                    raise ValueError("SQS MessageBody exceeds the 1 MiB message limit.")
+            except (KeyError, TypeError, ValueError) as exc:
+                record_row_error(result, index, record_preview(record), exc)
+                result.errors.append(str(exc))
+                if sync_options.on_error == "fail":
+                    result.skipped = len(records) - result.total
+                    return result
+                continue
+
+            if entries and (
+                len(entries) == _MAX_ENTRIES or payload_bytes + size > _MAX_PAYLOAD_BYTES
+            ):
+                self._send_batch(client, queue_url, entries, records, result, sync_options, limiter)
+                if result.failed and sync_options.on_error == "fail":
+                    # Unsent rows must not be inferred as delivered by the engine.
+                    result.skipped = len(records) - result.total
+                    return result
+                entries = []
+                payload_bytes = 0
+            entries.append(entry)
+            payload_bytes += size
+
+        if entries:
+            self._send_batch(client, queue_url, entries, records, result, sync_options, limiter)
+        return result
 
     @staticmethod
     def _client(config: SQSDestinationConfig) -> Any:
@@ -76,3 +115,15 @@ class SQSDestination:
                     )
                 entry[parameter] = text
         return entry
+
+    @staticmethod
+    def _send_batch(
+        client: Any,
+        queue_url: str,
+        entries: list[dict[str, str]],
+        records: list[dict[str, Any]],
+        result: SyncResult,
+        sync_options: SyncOptions,
+        limiter: RateLimiterBackend,
+    ) -> None:
+        pass
