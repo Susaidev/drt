@@ -7,6 +7,7 @@ from json import dumps
 from decimal import Decimal
 from uuid import UUID
 
+from drt.config.credentials import resolve_env
 from drt.config.models import DestinationConfig, SQSDestinationConfig, SyncOptions
 from drt.destinations.base import SyncResult
 
@@ -19,7 +20,29 @@ class SQSDestination:
         sync_options: SyncOptions,
     ) -> SyncResult:
         assert isinstance(config, SQSDestinationConfig)
-        raise NotImplementedError("SQS message delivery is not implemented yet.")
+        if not records:
+            return SyncResult()
+
+        queue_url = resolve_env(None, config.queue_url_env)
+        if not queue_url:
+            raise ValueError(
+                "SQS destination: queue_url_env must resolve to a non-empty queue URL "
+                f"(set {config.queue_url_env!r})."
+            )
+        if queue_url.endswith(".fifo"):
+            if not config.message_group_id_field:
+                raise ValueError(
+                    "SQS message_group_id_field is required for a FIFO queue "
+                    "(resolved queue URL ends in .fifo)."
+                )
+        else:
+            for field in ("message_group_id_field", "deduplication_id_field"):
+                if getattr(config, field) is not None:
+                    raise ValueError(
+                        f"SQS {field} is invalid for a standard queue; "
+                        "this field requires a FIFO queue URL ending in .fifo."
+                    )
+        
 
     @staticmethod
     def _client(config: SQSDestinationConfig) -> Any:
