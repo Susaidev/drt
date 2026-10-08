@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import UUID
-from requests.exceptions import ConnectionError
 
 import pytest
+from requests.exceptions import ConnectionError
 
 from drt.config.credentials import BigQueryProfile
 from drt.config.models import (
@@ -397,7 +397,10 @@ def test_incomplete_http_200_response_is_not_all_success(client: MagicMock) -> N
         SQSDestination().load([{"id": 1}], _config(), _options())
     assert client.send_message_batch.call_count == 1
 
-def test_send_transport_error_fails_sync(client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+
+def test_send_transport_error_fails_sync(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL)
 
     client.send_message_batch.side_effect = ConnectionError("network unavailable")
