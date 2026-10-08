@@ -141,7 +141,7 @@ class SQSDestination:
         
         def send_pending() -> None:
             limiter.acquire()
-            response = client.send_message_batch(QueueUrl=queue_url, Entries=list(pending.values))
+            response = client.send_message_batch(QueueUrl=queue_url, Entries=list(pending.values()))
             successes = response.get("Successful", [])
             failures = response.get("Failed", [])
             reported = [entry["Id"] for entry in successes + failures]
