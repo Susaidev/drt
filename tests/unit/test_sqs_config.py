@@ -1,4 +1,4 @@
-"""Focused tests for SQS config and connector scaffolding."""
+"""Focused tests for SQS config and connector registration."""
 
 from __future__ import annotations
 
@@ -8,7 +8,8 @@ from pydantic import ValidationError
 from drt.config import models
 from drt.config.connectors import install_target
 from drt.connectors.registry import get_destination
-from drt.destinations.base import Destination
+from drt.destinations.base import SyncResult
+from drt.destinations.sqs import SQSDestination
 
 
 def test_sqs_config_parses_in_sync() -> None:
@@ -50,17 +51,15 @@ def test_sqs_config_requires_queue_url_env() -> None:
         models.SyncConfig(name="work_items", model="work_items", destination={"type": "sqs"})
 
 
-@pytest.mark.parametrize("records", [[], [{"id": 1}]])
-def test_sqs_registry_returns_unimplemented_destination(records: list[dict[str, int]]) -> None:
+def test_sqs_registry_returns_destination() -> None:
     sync = models.SyncConfig(
         name="work_items",
         model="work_items",
         destination={"type": "sqs", "queue_url_env": "SQS_QUEUE_URL"},
     )
     destination = get_destination(sync.destination)
-    assert isinstance(destination, Destination)
-    with pytest.raises(NotImplementedError, match="SQS"):
-        destination.load(records, sync.destination, sync.sync)
+    assert isinstance(destination, SQSDestination)
+    assert destination.load([], sync.destination, sync.sync) == SyncResult()
 
 
 def test_sqs_install_target_uses_optional_extra() -> None:
