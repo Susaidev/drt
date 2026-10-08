@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any
-from json import dumps
 from decimal import Decimal
+from json import dumps
+from typing import Any
 from uuid import UUID
 
 from drt.config.credentials import resolve_env
@@ -17,8 +17,10 @@ from drt.destinations.row_errors import record_preview, record_row_error
 _MAX_ENTRIES = 10
 _MAX_PAYLOAD_BYTES = 1_048_576
 
+
 class _TransientBatchError(Exception):
     """Signal that the pending entries need another bounded attempt."""
+
 
 class SQSDestination:
     def load(
@@ -138,7 +140,7 @@ class SQSDestination:
             record_row_error(result, index, record_preview(records[index]), ValueError(message))
             result.errors.append(message)
             del pending[id_]
-        
+
         def send_pending() -> None:
             limiter.acquire()
             response = client.send_message_batch(QueueUrl=queue_url, Entries=list(pending.values()))
