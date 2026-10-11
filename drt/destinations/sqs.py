@@ -1,4 +1,11 @@
-"""Amazon SQS destination scaffolding; message delivery is not implemented yet."""
+"""Amazon SQS destination.
+
+FIFO ordering is guaranteed only for entries accepted on the first
+delivery attempt. If a batch contains a transient failure, later entries
+in the same MessageGroupId may be accepted before the failed entry is
+retried, because retries include only still-pending entries.
+
+"""
 
 from __future__ import annotations
 
