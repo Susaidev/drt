@@ -411,3 +411,26 @@ def test_send_transport_error_fails_sync(
             _config(),
             _options(),
         )
+
+def test_fifo_retry_resubmits_only_failed_entries_and_documents_ordering_caveat(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + ".fifo")
+
+    first = _success("1")
+    first["Failed"] = [_failure("0", sender_fault=False)]
+    client.send_message_batch.side_effect = [first, _success("0")]
+
+    records = [{"id": 0, "group": "orders"}, {"id": 1, "group": "orders"}]
+    result = SQSDestination().load(
+        records,
+        _config(message_group_id_field="group"),
+        _options(),
+    )
+
+    calls = client.send_message_batch.call_args_list
+    print("Calls: ", calls)
+    assert [entry["Id"] for entry in calls[0].kwargs["Entries"]] == ["0", "1"]
+    assert [entry["Id"] for entry in calls[1].kwargs["Entries"]] == ["0"]
+    assert result.success == 2
+    assert result.failed == 0
