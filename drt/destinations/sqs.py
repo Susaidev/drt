@@ -140,8 +140,8 @@ class SQSDestination:
                 entry[parameter] = text
         return entry
 
-    @staticmethod
     def _send_batch(
+        self,
         client: Any,
         queue_url: str,
         entries: list[dict[str, str]],
@@ -157,6 +157,9 @@ class SQSDestination:
             index = int(id_)
             record_row_error(result, index, record_preview(records[index]), ValueError(message))
             result.errors.append(message)
+            group = pending[id_].get("MessageGroupId")
+            if group is not None:
+                self._blocked_groups.add((queue_url, group))
             del pending[id_]
 
         def send_pending() -> None:
