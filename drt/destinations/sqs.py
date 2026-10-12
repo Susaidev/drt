@@ -70,12 +70,24 @@ class SQSDestination:
         entries: list[dict[str, str]] = []
         payload_bytes = 0
         for index, record in enumerate(records):
+            group_value = (
+                record.get(config.message_group_id_field)
+                if config.message_group_id_field is not None
+                else None
+            )
+            group_key = (
+                (queue_url, str(group_value))
+                if isinstance(group_value, (str, int, float, Decimal, UUID))
+                else None
+            )
             try:
                 entry = self._entry(index, record, config)
                 size = len(entry["MessageBody"].encode("utf-8"))
                 if size > _MAX_PAYLOAD_BYTES:
                     raise ValueError("SQS MessageBody exceeds the 1 MiB message limit.")
             except (KeyError, TypeError, ValueError) as exc:
+                if group_key is not None:
+                    self._blocked_groups.add(group_key)
                 record_row_error(result, index, record_preview(record), exc)
                 result.errors.append(str(exc))
                 if sync_options.on_error == "fail":
