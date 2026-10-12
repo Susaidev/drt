@@ -110,6 +110,19 @@ class SQSDestination:
                     return result
                 entries = []
                 payload_bytes = 0
+            if group_key in self._blocked_groups:
+                blocked_group_name = group_key[1]
+                message = (
+                    "SQS FIFO group "
+                    f"{blocked_group_name!r} is blocked by an earlier failed record "
+                    "in this run."
+                )
+                record_row_error(result, index, record_preview(record), ValueError(message))
+                result.errors.append(message)
+                if sync_options.on_error == "fail":
+                    result.skipped = len(records) - result.total
+                    return result
+                continue
             entries.append(entry)
             payload_bytes += size
 
