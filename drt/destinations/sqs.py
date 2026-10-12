@@ -30,6 +30,9 @@ class _TransientBatchError(Exception):
 
 
 class SQSDestination:
+    def __init__(self) -> None:
+        self._blocked_groups: set[tuple[str, str]] = set()
+
     def load(
         self,
         records: list[dict[str, Any]],
@@ -95,6 +98,14 @@ class SQSDestination:
         if entries:
             self._send_batch(client, queue_url, entries, records, result, sync_options, limiter)
         return result
+
+    def reset_write_state(
+            self,
+            config: DestinationConfig | None,
+            sync_options: SyncOptions | None
+    ) -> None:
+        """The engine calls this after every run, including raised exits."""
+        self._blocked_groups.clear()
 
     @staticmethod
     def _client(config: SQSDestinationConfig) -> Any:
