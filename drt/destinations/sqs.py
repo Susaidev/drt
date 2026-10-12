@@ -96,7 +96,12 @@ class SQSDestination:
                 continue
 
             if entries and (
-                len(entries) == _MAX_ENTRIES or payload_bytes + size > _MAX_PAYLOAD_BYTES
+                len(entries) == _MAX_ENTRIES
+                or payload_bytes + size > _MAX_PAYLOAD_BYTES
+                or (
+                    group_key is not None
+                    and any(item["MessageGroupId"] == group_key[1] for item in entries)
+                )
             ):
                 self._send_batch(client, queue_url, entries, records, result, sync_options, limiter)
                 if result.failed and sync_options.on_error == "fail":
