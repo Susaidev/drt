@@ -100,9 +100,7 @@ class SQSDestination:
         return result
 
     def reset_write_state(
-            self,
-            config: DestinationConfig | None,
-            sync_options: SyncOptions | None
+        self, config: DestinationConfig | None, sync_options: SyncOptions | None
     ) -> None:
         """The engine calls this after every run, including raised exits."""
         self._blocked_groups.clear()
