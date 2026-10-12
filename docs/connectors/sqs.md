@@ -95,8 +95,30 @@ same effect as processing it once. For example, record processed event IDs
 and ignore duplicates.
 
 FIFO deduplication can suppress duplicates within SQS's deduplication window
-when the same deduplication ID or message body is reused. Partial retries
-can change the acceptance order of messages that initially failed.
+when the same deduplication ID or message body is reused.
+
+## FIFO ordering
+
+Within a sync run, drt preserves the extracted record order for each
+`MessageGroupId`, including during partial-failure retries. A request contains
+at most one entry from each group. The next message in a group is sent only
+after its predecessor is confirmed successful; different groups can share a
+batch. A queue using a single group therefore sends one message per request.
+
+A sender fault, exhausted retry, or invalid record with an identifiable
+group blocks that group for the rest of the run. With `sync.on_error: skip`,
+its later records become RowErrors without being sent, and are captured in
+source order when the DLQ is enabled; independent groups continue. With
+`fail`, loading stops and unattempted input rows count as skipped. Blocking
+persists across engine batches and resets at the end of the run, including
+after a raised exception.
+
+This guarantee follows extraction order. Use an explicit `ORDER BY` in your
+model query when chronological order matters, and avoid overlapping producers
+or sync runs publishing the same group. It does not establish ordering across
+separate runs or arbitrary manual replays; recover failed and blocked records
+in their original per-group order. Direct callers reusing a destination across
+logical runs should call `reset_write_state(config, sync_options)` between runs.
 
 ## Partial failures and retries
 
