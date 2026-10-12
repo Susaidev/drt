@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Iterator
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -412,14 +413,21 @@ def test_send_transport_error_fails_sync(
             _options(),
         )
 
-def test_fifo_retry_resubmits_only_failed_entries_and_documents_ordering_caveat(
+
+def test_fifo_retry_confirms_first_message_before_sending_next_in_group(
     client: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + ".fifo")
 
-    first = _success("1")
-    first["Failed"] = [_failure("0", sender_fault=False)]
-    client.send_message_batch.side_effect = [first, _success("0")]
+    def send(**kwargs: Any) -> dict[str, Any]:
+        ids = [entry["Id"] for entry in kwargs["Entries"]]
+        if client.send_message_batch.call_count == 1:
+            response = _success(*(id_ for id_ in ids if id_ != "0"))
+            response["Failed"] = [_failure("0", sender_fault=False)]
+            return response
+        return _success(*ids)
+
+    client.send_message_batch.side_effect = send
 
     records = [{"id": 0, "group": "orders"}, {"id": 1, "group": "orders"}]
     result = SQSDestination().load(
@@ -428,9 +436,232 @@ def test_fifo_retry_resubmits_only_failed_entries_and_documents_ordering_caveat(
         _options(),
     )
 
-    calls = client.send_message_batch.call_args_list
-    print("Calls: ", calls)
-    assert [entry["Id"] for entry in calls[0].kwargs["Entries"]] == ["0", "1"]
-    assert [entry["Id"] for entry in calls[1].kwargs["Entries"]] == ["0"]
+    assert [call.kwargs["Entries"] for call in client.send_message_batch.call_args_list] == [
+        [{"Id": "0", "MessageBody": '{"id": 0, "group": "orders"}', "MessageGroupId": "orders"}],
+        [{"Id": "0", "MessageBody": '{"id": 0, "group": "orders"}', "MessageGroupId": "orders"}],
+        [{"Id": "1", "MessageBody": '{"id": 1, "group": "orders"}', "MessageGroupId": "orders"}],
+    ]
     assert result.success == 2
     assert result.failed == 0
+
+
+def test_fifo_batches_different_groups_without_resending_confirmed_entries(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + ".fifo")
+
+    def send(**kwargs: Any) -> dict[str, Any]:
+        ids = [entry["Id"] for entry in kwargs["Entries"]]
+        if client.send_message_batch.call_count == 1:
+            response = _success(*(id_ for id_ in ids if id_ != "0"))
+            response["Failed"] = [_failure("0", sender_fault=False)]
+            return response
+        return _success(*ids)
+
+    client.send_message_batch.side_effect = send
+    records = [{"id": i, "group": group} for i, group in enumerate(["a", "b", "a", "b"])]
+    result = SQSDestination().load(records, _config(message_group_id_field="group"), _options())
+    assert [
+        [entry["Id"] for entry in call.kwargs["Entries"]]
+        for call in client.send_message_batch.call_args_list
+    ] == [["0", "1"], ["0"], ["2", "3"]]
+    assert result.success == 4
+    assert result.failed == 0
+
+
+@pytest.mark.parametrize("sender_fault", [True, False])
+def test_fifo_failed_group_blocks_followers_but_other_groups_continue(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch, sender_fault: bool
+) -> None:
+    monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + ".fifo")
+
+    def send(**kwargs: Any) -> dict[str, Any]:
+        ids = [entry["Id"] for entry in kwargs["Entries"]]
+        response = _success(*(id_ for id_ in ids if id_ != "0"))
+        if "0" in ids:
+            response["Failed"] = [_failure("0", sender_fault=sender_fault)]
+        return response
+
+    client.send_message_batch.side_effect = send
+    records = [{"id": i, "group": group} for i, group in enumerate(["a", "b", "a", "b", "a"])]
+    result = SQSDestination().load(records, _config(message_group_id_field="group"), _options())
+    expected = [["0", "1"], ["3"]] if sender_fault else [["0", "1"], ["0"], ["0"], ["3"]]
+    assert [
+        [entry["Id"] for entry in call.kwargs["Entries"]]
+        for call in client.send_message_batch.call_args_list
+    ] == expected
+    assert result.success == 2
+    assert result.failed == 3
+    assert result.total == len(records)
+    assert [error.batch_index for error in result.row_errors] == [0, 2, 4]
+    assert all("blocked" in error.error_message for error in result.row_errors[1:])
+
+
+@pytest.mark.parametrize("invalid", ["oversized", "missing_dedup"])
+def test_fifo_invalid_record_blocks_later_records_in_its_group(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + ".fifo")
+    records = [
+        {"id": i, "group": group, "event": str(i)} for i, group in enumerate(["a", "a", "a", "b"])
+    ]
+    if invalid == "oversized":
+        records[1]["payload"] = "x" * 1_048_576
+    else:
+        del records[1]["event"]
+    result = SQSDestination().load(
+        records, _config(message_group_id_field="group", deduplication_id_field="event"), _options()
+    )
+    assert [
+        [entry["Id"] for entry in call.kwargs["Entries"]]
+        for call in client.send_message_batch.call_args_list
+    ] == [["0"], ["3"]]
+    assert result.success == 2
+    assert [error.batch_index for error in result.row_errors] == [1, 2]
+
+
+def test_fifo_failure_dlq_keeps_original_group_order(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + ".fifo")
+    failure = _success()
+    failure["Failed"] = [_failure("0", sender_fault=True)]
+    client.send_message_batch.side_effect = [failure, _success("3")]
+    records = [
+        {"id": 0, "group": "a", "event": "0"},
+        {"id": 1, "group": "a"},
+        {"id": 2, "group": "a", "event": "2"},
+        {"id": 3, "group": "b", "event": "3"},
+    ]
+    sync = SyncConfig(
+        name="fifo",
+        model="SELECT 1",
+        destination=_config(message_group_id_field="group", deduplication_id_field="event"),
+        sync=_options(),
+    )
+    store = LocalDlqStore(tmp_path)
+    result = run_sync(
+        sync,
+        FakeSource(records),
+        SQSDestination(),
+        BigQueryProfile(type="bigquery", project="p", dataset="d"),
+        tmp_path,
+        observer=DlqObserver(store),
+    )
+    assert result.success == 1
+    assert result.failed == 3
+    assert [error.batch_index for error in result.row_errors] == [0, 1, 2]
+    assert [letter.record["id"] for letter in store.read(sync.name)] == [0, 1, 2]
+
+
+def test_fifo_blocked_groups_survive_engine_batches_and_reset_after_run(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + ".fifo")
+    failure = _success()
+    failure["Failed"] = [_failure("0", sender_fault=True)]
+    client.send_message_batch.side_effect = [failure, _success("0"), _success("0")]
+    records = [{"id": i, "group": group} for i, group in enumerate(["a", "a", "b"])]
+    sync = SyncConfig(
+        name="fifo",
+        model="SELECT 1",
+        destination=_config(message_group_id_field="group"),
+        sync=_options(batch_size=1),
+    )
+    destination = SQSDestination()
+    profile = BigQueryProfile(type="bigquery", project="p", dataset="d")
+    store = LocalDlqStore(tmp_path)
+    result = run_sync(
+        sync, FakeSource(records), destination, profile, tmp_path, observer=DlqObserver(store)
+    )
+    assert result.success == 1
+    assert result.failed == 2
+    assert [letter.record["id"] for letter in store.read(sync.name)] == [0, 1]
+    again = run_sync(sync, FakeSource([{"id": 3, "group": "a"}]), destination, profile, tmp_path)
+    assert again.success == 1
+    assert again.failed == 0
+    assert [
+        json.loads(call.kwargs["Entries"][0]["MessageBody"])["id"]
+        for call in client.send_message_batch.call_args_list
+    ] == [0, 2, 3]
+
+
+def test_fifo_failed_group_does_not_block_another_queue(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + ".fifo")
+    failure = _success()
+    failure["Failed"] = [_failure("0", sender_fault=True)]
+    client.send_message_batch.side_effect = [failure, _success("0")]
+    destination = SQSDestination()
+    config = _config(message_group_id_field="group")
+    destination.load([{"id": 0, "group": "a"}], config, _options())
+    monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + "-other.fifo")
+    result = destination.load([{"id": 1, "group": "a"}], config, _options())
+    assert result.success == 1
+    assert result.failed == 0
+
+
+@pytest.mark.parametrize("large", [False, True])
+def test_fifo_distinct_groups_respect_batch_limits(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch, large: bool
+) -> None:
+    monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + ".fifo")
+    records = [
+        {"id": i, "group": str(i), "payload": "é" * 200000 if large else ""}
+        for i in range(3 if large else 23)
+    ]
+    result = SQSDestination().load(records, _config(message_group_id_field="group"), _options())
+    assert result.success == len(records)
+    batches = [call.kwargs["Entries"] for call in client.send_message_batch.call_args_list]
+    assert [len(batch) for batch in batches] == ([2, 1] if large else [10, 10, 3])
+    for batch in batches:
+        assert len({entry["MessageGroupId"] for entry in batch}) == len(batch)
+        assert sum(len(entry["MessageBody"].encode("utf-8")) for entry in batch) <= 1_048_576
+
+
+def test_fifo_fail_policy_stops_all_further_sends(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + ".fifo")
+    failure = _success()
+    failure["Failed"] = [_failure("0", sender_fault=True)]
+    client.send_message_batch.side_effect = [failure]
+    records = [{"id": i, "group": group} for i, group in enumerate(["a", "a", "b"])]
+    options = _options().model_copy(update={"on_error": "fail"})
+    result = SQSDestination().load(records, _config(message_group_id_field="group"), options)
+    assert client.send_message_batch.call_count == 1
+    assert result.success == 0
+    assert result.failed == 1
+    assert result.skipped == 2
+    assert result.total == len(records)
+
+
+def test_fifo_blocked_groups_reset_after_source_exception(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + ".fifo")
+    failure = _success()
+    failure["Failed"] = [_failure("0", sender_fault=True)]
+    client.send_message_batch.side_effect = [failure, _success("0")]
+    sync = SyncConfig(
+        name="fifo",
+        model="SELECT 1",
+        destination=_config(message_group_id_field="group"),
+        sync=_options(batch_size=1),
+    )
+    destination = SQSDestination()
+    profile = BigQueryProfile(type="bigquery", project="p", dataset="d")
+
+    def rows() -> Iterator[dict[str, Any]]:
+        yield {"id": 0, "group": "a"}
+        raise RuntimeError("source interrupted")
+
+    source = FakeSource()
+    with patch.object(source, "extract", return_value=rows()):
+        with pytest.raises(RuntimeError, match="source interrupted"):
+            run_sync(sync, source, destination, profile, tmp_path)
+    result = run_sync(sync, FakeSource([{"id": 1, "group": "a"}]), destination, profile, tmp_path)
+    assert result.success == 1
+    assert result.failed == 0
+    assert client.send_message_batch.call_count == 2
