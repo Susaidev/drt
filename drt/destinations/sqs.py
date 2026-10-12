@@ -49,7 +49,8 @@ class SQSDestination:
                 "SQS destination: queue_url_env must resolve to a non-empty queue URL "
                 f"(set {config.queue_url_env!r})."
             )
-        if queue_url.endswith(".fifo"):
+        is_fifo = queue_url.endswith(".fifo")
+        if is_fifo:
             if not config.message_group_id_field:
                 raise ValueError(
                     "SQS message_group_id_field is required for a FIFO queue "
@@ -97,6 +98,11 @@ class SQSDestination:
 
         if entries:
             self._send_batch(client, queue_url, entries, records, result, sync_options, limiter)
+
+        if is_fifo:
+            # Validation can fail before an earlier buffered send completes.
+            # Sort the source when the engine stores these rows in the DLQ.
+            result.row_errors.sort(key=lambda error: error.batch_index)
         return result
 
     def reset_write_state(
