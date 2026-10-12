@@ -1,10 +1,11 @@
 """Amazon SQS destination.
 
-FIFO ordering is guaranteed only for entries accepted on the first
-delivery attempt. If a batch contains a transient failure, later entries
-in the same MessageGroupId may be accepted before the failed entry is
-retried, because retries include only still-pending entries.
+For FIFO queues, drt sends at most one entry per MessageGroupId per
+batch. A later entry in a group is held back until its predecessor is
+confirmed successful. If the predecessor permanently fails, later entries
+in that group become RowErrors for the current run.
 
+Please refer to sqs.md for more information.
 """
 
 from __future__ import annotations
@@ -31,6 +32,10 @@ class _TransientBatchError(Exception):
 
 class SQSDestination:
     def __init__(self) -> None:
+        """
+        _blocked_groups contains FIFO grouops whose earlier records failed during the current run.
+        The engine clears this state by calling reset_write_state() after the run.
+        """
         self._blocked_groups: set[tuple[str, str]] = set()
 
     def load(
@@ -39,6 +44,20 @@ class SQSDestination:
         config: DestinationConfig,
         sync_options: SyncOptions,
     ) -> SyncResult:
+        """Serialize records and deliver them to Amazon SQS.
+
+        Steps:
+        - Each record is validated and converted into a SQS entry.
+        - Entries are grouped into batch requests of at most 10 entries and 1MiB of message bodies.
+        - For FIFO queues, a batch contains at most one entry per MessageGroupId,
+          so the next record in a group is held until its predecessor's batch has completed.
+        - Batch will be sent to SQS.
+
+        Returns:
+            The delivery result, including successful, failed,
+            and skipped rows as well as row errors.
+
+        """
         assert isinstance(config, SQSDestinationConfig)
         if not records:
             return SyncResult()
@@ -128,10 +147,9 @@ class SQSDestination:
 
         if entries:
             self._send_batch(client, queue_url, entries, records, result, sync_options, limiter)
-
         if is_fifo:
             # Validation can fail before an earlier buffered send completes.
-            # Sort the source when the engine stores these rows in the DLQ.
+            # Preserve source order when the engine stores these rows in the DLQ.
             result.row_errors.sort(key=lambda error: error.batch_index)
         return result
 
@@ -143,6 +161,7 @@ class SQSDestination:
 
     @staticmethod
     def _client(config: SQSDestinationConfig) -> Any:
+        """Create an SQS client using boto3's standard credential chain."""
         try:
             import boto3  # type: ignore[import-untyped]
         except ImportError as exc:
@@ -152,6 +171,8 @@ class SQSDestination:
 
     @staticmethod
     def _entry(index: int, record: dict[str, Any], config: SQSDestinationConfig) -> dict[str, str]:
+        """Create an entry: an input data format for SQS."""
+
         entry = {
             "Id": str(index),
             "MessageBody": dumps(record, default=str, ensure_ascii=False),
@@ -184,6 +205,18 @@ class SQSDestination:
         sync_options: SyncOptions,
         limiter: RateLimiterBackend,
     ) -> None:
+        """
+        Deliver one SQS batch and retry transient entry failures.
+
+        Successful entries are removed from the pending set. Permanent
+        sender faults become RowErrors immediately. Transient entry failures
+        remain pending and are retried according to the configured retry
+        policy. Entries still pending after retry exhaustion become RowErrors
+        and block their FIFO groups for the remainder of the run.
+
+        An incomplete or inconsistent SQS response raises RuntimeError.
+        Transport exceptions from the SQS client are allowed to propagate.
+        """
         pending = {entry["Id"]: entry for entry in entries}
         last_errors: dict[str, str] = {}
 
