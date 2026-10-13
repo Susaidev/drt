@@ -83,6 +83,12 @@ class SyncResult:
     # any Destination implementation — unlike skipped_no_match, this
     # decision never reaches the destination.
     skipped_duplicate: int = 0
+    # Properties/columns a ``write_policy: fill_empty`` destination deliberately
+    # left unchanged because the destination already held a non-empty value.
+    # Appended for positional-constructor compatibility. SQL destinations cannot
+    # observe this from their single MERGE/upsert statement; read-before-write
+    # destinations such as HubSpot can report the exact count.
+    kept_values: int = 0
 
     @property
     def total(self) -> int:
@@ -156,6 +162,24 @@ class MatchPolicyCapable(Protocol):
 
     def supported_match_policies(self) -> frozenset[str]:
         """Return the ``match_policy`` values this destination honours."""
+        ...
+
+
+@runtime_checkable
+class WritePolicyCapable(Protocol):
+    """Destination that honours ``sync.write_policy: fill_empty`` (#1238).
+
+    Stability: Evolving (added after the v1.0 freeze as an additive capability, ADR 0007).
+
+    ``fill_empty`` writes a column only when the destination's current value is NULL
+    or an empty string. That needs either a read-before-write or a conditional update
+    expression, so it is an opt-in capability the engine checks structurally; a
+    destination that does not implement it fails fast rather than silently
+    overwriting values the policy exists to protect.
+    """
+
+    def supported_write_policies(self) -> frozenset[str]:
+        """Return the ``write_policy`` values this destination honours."""
         ...
 
 

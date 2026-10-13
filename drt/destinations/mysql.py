@@ -30,6 +30,13 @@ from drt.destinations._serializer import serialize_complex_value
 from drt.destinations.base import SyncResult
 from drt.destinations.sql_base import _ROW_SAVEPOINT, BaseSqlDestination
 
+_MYSQL_DUPLICATE_ENTRY = 1062
+
+
+def _is_duplicate_entry(exc: Exception) -> bool:
+    """Return whether pymysql reported a duplicate UNIQUE/PRIMARY key."""
+    return bool(exc.args) and exc.args[0] == _MYSQL_DUPLICATE_ENTRY
+
 
 def _mysql_json_encoder(value: Any) -> str:
     """Wire-format a dict/list as a JSON string for pymysql.
@@ -361,6 +368,14 @@ class MySQLDestination(BaseSqlDestination):
         """Declare the advanced sync modes implemented by MySQL (#1042)."""
         return frozenset({"replace", "mirror"})
 
+    def supported_match_policies(self) -> frozenset[str]:
+        """MySQL honours all three ``match_policy`` values (#757)."""
+        return frozenset({"upsert", "update_only", "create_only"})
+
+    def supported_write_policies(self) -> frozenset[str]:
+        """MySQL honours ``write_policy: fill_empty`` in the upsert update clause (#1238)."""
+        return frozenset({"overwrite", "fill_empty"})
+
     def _shadow_name(self, table: str) -> str:
         return f"{table}__drt_swap"
 
@@ -522,13 +537,52 @@ class MySQLDestination(BaseSqlDestination):
         entirely under ``on_error: fail`` (Codex review on #1139).
         """
         result = SyncResult()
+        policy = sync_options.match_policy
+        if policy != "upsert" and not config.upsert_key:
+            raise ValueError(
+                f"sync.match_policy: {policy} needs at least one destination.upsert_key column."
+            )
         schema_map = self._resolve_schema(config)
         use_savepoint = sync_options.on_error == "skip"
+        no_match_indices: set[int] = set()
+
+        self._validate_write_policy_overrides(sync_options, schema_map)
 
         base_index = 0
         for run_columns, run_records in self._contiguous_signature_runs(records):
             update_cols = [c for c in run_columns if c not in config.upsert_key]
-            sql = MySQLDestination._build_upsert_sql(config.table, run_columns, update_cols)
+            # write_policy: fill_empty (#1238): these columns keep a non-empty destination value.
+            fill_cols = sync_options.fill_empty_columns(update_cols)
+            exists_sql: str | None = None
+            if policy == "create_only":
+                # A plain INSERT is intentional. INSERT IGNORE would also
+                # suppress/coerce non-duplicate data errors, while a no-op
+                # ON DUPLICATE KEY UPDATE would fire UPDATE triggers even
+                # though create_only promises to leave existing rows alone.
+                sql = MySQLDestination._build_insert_sql(config.table, run_columns)
+                exists_sql = MySQLDestination._build_match_exists_sql(
+                    config.table, config.upsert_key
+                )
+                value_cols = run_columns
+            elif policy == "update_only":
+                if not update_cols:
+                    raise ValueError(
+                        "sync.match_policy: update_only needs at least one non-key "
+                        "column to update, but every column is in upsert_key."
+                    )
+                sql = MySQLDestination._build_update_only_sql(
+                    config.table, update_cols, config.upsert_key, fill_cols
+                )
+                exists_sql = MySQLDestination._build_match_exists_sql(
+                    config.table, config.upsert_key
+                )
+                value_cols = update_cols + config.upsert_key
+            else:
+                sql = MySQLDestination._build_upsert_sql(
+                    config.table, run_columns, update_cols, fill_cols
+                )
+                value_cols = run_columns
+
             for local_i, record in enumerate(run_records):
                 i = base_index + local_i
                 try:
@@ -536,20 +590,82 @@ class MySQLDestination(BaseSqlDestination):
                         cur.execute(f"SAVEPOINT {_ROW_SAVEPOINT}")
                     values = [
                         _serialize_value(record.get(c), c, config.json_columns, schema_map)
-                        for c in run_columns
+                        for c in value_cols
                     ]
                     cur.execute(sql, values)
+
+                    no_match = False
+                    if policy == "update_only" and cur.rowcount == 0:
+                        # MySQL reports rows *changed*, not rows matched. An
+                        # existing row assigned its current values therefore
+                        # also reports zero. Probe only that ambiguous case so
+                        # unchanged matches remain successes and truly absent
+                        # keys become skipped_no_match.
+                        assert exists_sql is not None
+                        key_values = values[-len(config.upsert_key) :]
+                        cur.execute(exists_sql, key_values)
+                        no_match = cur.fetchone() is None
+
                     if use_savepoint:
                         # See _load_replace's comment (#1139 round 6):
                         # count success only after RELEASE SAVEPOINT
                         # itself succeeds.
                         cur.execute(f"RELEASE SAVEPOINT {_ROW_SAVEPOINT}")
-                    result.success += 1
+                    if no_match:
+                        result.skipped += 1
+                        result.skipped_no_match += 1
+                        no_match_indices.add(i)
+                    else:
+                        result.success += 1
                 except Exception as e:
+                    if policy == "create_only" and _is_duplicate_entry(e):
+                        # MySQL reports the same 1062 code for *every* UNIQUE
+                        # constraint. Only a collision on this sync's
+                        # upsert_key is the expected create_only no-match;
+                        # an unrelated unique-key collision remains a real
+                        # row error, matching Postgres' targeted ON CONFLICT.
+                        assert exists_sql is not None
+                        try:
+                            key_values = [
+                                _serialize_value(record.get(c), c, config.json_columns, schema_map)
+                                for c in config.upsert_key
+                            ]
+                            cur.execute(exists_sql, key_values)
+                            duplicate_matches = cur.fetchone() is not None
+                        except Exception as probe_error:
+                            duplicate_matches = False
+                            e = RuntimeError(
+                                "create_only could not verify a duplicate against "
+                                f"destination.upsert_key: {probe_error}"
+                            )
+
+                        if duplicate_matches:
+                            # A normal MySQL statement error rolls back that
+                            # statement only; under on_error:skip, also pop the
+                            # row savepoint so it does not accumulate across
+                            # the rest of the batch.
+                            result.skipped += 1
+                            result.skipped_no_match += 1
+                            no_match_indices.add(i)
+                            if use_savepoint and not self._recover_row_savepoint(conn, cur):
+                                self._mark_batch_aborted(
+                                    result,
+                                    records,
+                                    i,
+                                    exclude_indices=frozenset(no_match_indices),
+                                )
+                                return result
+                            continue
+
                     self._record_row_error(result, i, record, e)
                     if sync_options.on_error == "fail":
                         conn.rollback()
-                        self._mark_batch_aborted(result, records, i)
+                        self._mark_batch_aborted(
+                            result,
+                            records,
+                            i,
+                            exclude_indices=frozenset(no_match_indices),
+                        )
                         return result
                     if not self._recover_row_savepoint(conn, cur):
                         # The row-level savepoint rollback itself failed
@@ -557,7 +673,12 @@ class MySQLDestination(BaseSqlDestination):
                         # back the *whole* transaction) -- every row this
                         # call counted so far, including earlier
                         # successes, was discarded with it (#1139).
-                        self._mark_batch_aborted(result, records, i)
+                        self._mark_batch_aborted(
+                            result,
+                            records,
+                            i,
+                            exclude_indices=frozenset(no_match_indices),
+                        )
                         return result
                     continue
             base_index += len(run_records)
@@ -578,20 +699,62 @@ class MySQLDestination(BaseSqlDestination):
         table: str,
         columns: list[str],
         update_cols: list[str],
+        fill_cols: set[str] | frozenset[str] = frozenset(),
     ) -> str:
-        """Build INSERT ... ON DUPLICATE KEY UPDATE SQL."""
+        """Build INSERT ... ON DUPLICATE KEY UPDATE SQL.
+
+        ``fill_cols`` (``write_policy: fill_empty``, #1238) keep the stored value unless it
+        is NULL, ``''`` or only spaces; the CHAR cast is for the comparison only, so it is valid for
+        any column type.
+        """
         cols_str = ", ".join(f"`{c}`" for c in columns)
         placeholders = ", ".join(["%s"] * len(columns))
         table_q = MySQLDestination._quote_ident(table)
 
         if update_cols:
-            set_clause = ", ".join(f"`{c}` = VALUES(`{c}`)" for c in update_cols)
+            set_clause = ", ".join(
+                f"`{c}` = IF(`{c}` IS NULL OR TRIM(CAST(`{c}` AS CHAR)) = '', VALUES(`{c}`), `{c}`)"
+                if c in fill_cols
+                else f"`{c}` = VALUES(`{c}`)"
+                for c in update_cols
+            )
             return (
                 f"INSERT INTO {table_q} ({cols_str}) VALUES ({placeholders}) "
                 f"ON DUPLICATE KEY UPDATE {set_clause}"
             )
         # All columns are part of the key — just ignore duplicates
         return f"INSERT IGNORE INTO {table_q} ({cols_str}) VALUES ({placeholders})"
+
+    @staticmethod
+    def _build_update_only_sql(
+        table: str,
+        update_cols: list[str],
+        upsert_key: list[str],
+        fill_cols: set[str] | frozenset[str] = frozenset(),
+    ) -> str:
+        """Build an UPDATE that cannot create a missing destination row."""
+        table_q = MySQLDestination._quote_ident(table)
+        set_clause = ", ".join(
+            f"`{column}` = IF(`{column}` IS NULL OR "
+            f"TRIM(CAST(`{column}` AS CHAR)) = '', %s, `{column}`)"
+            if column in fill_cols
+            else f"`{column}` = %s"
+            for column in update_cols
+        )
+        where_clause = " AND ".join(f"`{column}` = %s" for column in upsert_key)
+        return f"UPDATE {table_q} SET {set_clause} WHERE {where_clause}"
+
+    @staticmethod
+    def _build_match_exists_sql(table: str, upsert_key: list[str]) -> str:
+        """Build the zero-row UPDATE disambiguation probe.
+
+        The predicate deliberately uses normal SQL equality. MySQL UNIQUE
+        indexes permit multiple NULLs, so treating NULLs as equal here could
+        update several rows even though they are not duplicates to MySQL.
+        """
+        table_q = MySQLDestination._quote_ident(table)
+        where_clause = " AND ".join(f"`{column}` = %s" for column in upsert_key)
+        return f"SELECT 1 FROM {table_q} WHERE {where_clause} LIMIT 1"
 
     @classmethod
     def _connect(cls, config: MySQLDestinationConfig) -> Any:

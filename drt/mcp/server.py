@@ -21,6 +21,8 @@ Tools:
     drt_doctor          — environment diagnostics (mirrors `drt doctor` CLI)
     drt_state_show      — stored watermark + last-run state (#776)
     drt_state_reset     — reset watermark / run state / mirror keys (#776)
+    drt_plan            — read-only change set for a sync + plan_id (#1220)
+    drt_apply           — apply a fetched plan if the world still matches (#1220)
 
 Business logic for each tool lives in ``drt/mcp/tools/`` (one module per
 tool, independently testable without a running server); this module wires
@@ -36,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from drt.mcp._context import _load_ctx
+from drt.mcp.tools.apply import apply as _apply
 from drt.mcp.tools.dlq import dlq as _dlq
 from drt.mcp.tools.doctor import doctor as _doctor
 from drt.mcp.tools.get_history import get_history as _get_history
@@ -45,6 +48,7 @@ from drt.mcp.tools.get_status import get_status as _get_status
 from drt.mcp.tools.list_connectors import list_connectors as _list_connectors
 from drt.mcp.tools.list_profiles import list_profiles as _list_profiles
 from drt.mcp.tools.list_syncs import list_syncs as _list_syncs
+from drt.mcp.tools.plan import plan as _plan
 from drt.mcp.tools.retry import retry as _retry
 from drt.mcp.tools.run_sync import run_sync as _run_sync
 from drt.mcp.tools.run_test import run_test as _run_test
@@ -69,7 +73,9 @@ def create_server(project_dir: Path | None = None) -> Any:
         instructions=(
             "drt is a Reverse ETL CLI tool. "
             "Use these tools to list, run, validate, and monitor data syncs "
-            "from a data warehouse to external services."
+            "from a data warehouse to external services. Sync configuration "
+            "supports cursor or warehouse snapshot-diff incremental delivery, "
+            "replace/mirror modes, and local, object-store, or warehouse state."
         ),
     )
 
@@ -90,7 +96,7 @@ def create_server(project_dir: Path | None = None) -> Any:
     # drt_run_sync
     # -----------------------------------------------------------------------
 
-    @mcp.tool()
+    @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
     def drt_run_sync(
         sync_name: str,
         dry_run: bool = False,
@@ -111,6 +117,10 @@ def create_server(project_dir: Path | None = None) -> Any:
                 record-level diff (added / updated / deleted / unchanged)
                 against the destination. Queryable destinations get a true
                 diff; non-queryable destinations get a sample preview.
+                Missing fields keep write semantics: partial upserts preserve
+                them, replace reports ``<default>``, and append-only writes
+                report INSERT. Snapshot-diff mirror previews use the exact
+                removed-key set without a destination delete scan.
                 Mirrors ``drt run --dry-run --diff`` (v0.7.1+).
             diff_limit: Cap on records per diff category (default 20).
             cursor_value: Override the incremental watermark for a bounded
@@ -126,8 +136,9 @@ def create_server(project_dir: Path | None = None) -> Any:
                 and read its warning before doing so.
             limit: Extract at most N rows — a sampled run for safe first
                 sends (mirrors ``drt run --limit``, #774). Watermarks do not
-                advance; rejected for ``mode: mirror``/``replace`` syncs,
-                where a sample would delete or replace real rows.
+                advance, and neither does an ``incremental_strategy: diff``
+                snapshot baseline; rejected for ``mode: mirror``/``replace``
+                syncs, where a sample would delete or replace real rows.
             vars: Override project vars for this run, e.g.
                 ``{"lookback_days": 1, "tag": "crm"}`` (mirrors
                 ``drt run --vars``, already parsed — no string form needed
@@ -149,6 +160,106 @@ def create_server(project_dir: Path | None = None) -> Any:
             profile_name=profile_name,
             full_refresh=full_refresh,
             limit=limit,
+            vars=vars,
+        )
+
+    @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+    def drt_plan(
+        sync_name: str,
+        redact_keys: bool = False,
+        cursor_value: str | None = None,
+        profile_name: str | None = None,
+        vars: dict[str, Any] | None = None,
+        max_entries: int = 100,
+    ) -> dict[str, Any]:
+        """Compute what a sync would change, without writing anything.
+
+        Read-only (mirrors ``drt plan``, #1216): the same complete, key-level
+        change set a human would review, never row values. The full plan is
+        stored on the server side and identified by the returned ``plan_id``;
+        ``drt_apply`` can only apply a plan fetched here.
+
+        Summarise the changes for the human (for example, what the deletes
+        are) and let them decide. Do not call ``drt_apply`` on your own
+        initiative.
+
+        Args:
+            sync_name: Name of the sync to plan (from drt_list_syncs).
+            redact_keys: Hash key values in the plan instead of showing them
+                (mirrors ``drt plan --redact-keys``). ``sync.mask`` columns are
+                always hashed.
+            cursor_value: Override the incremental watermark, as for
+                ``drt_run_sync``; pass the same value to ``drt_apply``.
+            profile_name: Override the profile (mirrors ``drt plan --profile``).
+            vars: Override project vars, already parsed (mirrors ``--vars``).
+            max_entries: How many changed keys to return (0-1000, default 100);
+                ``entries_total`` and ``entries_truncated`` say what was cut.
+                The summary counts always cover everything.
+
+        Returns:
+            ``plan_id``, ``summary`` (create/insert/update/replace/delete),
+            ``guards`` (configured limits and any that tripped), the first
+            ``entries``, and a ``next_step``. A sync that cannot be planned
+            returns ``available: false`` with the reason.
+        """
+        return _plan(
+            ctx,
+            sync_name,
+            redact_keys=redact_keys,
+            cursor_value=cursor_value,
+            profile_name=profile_name,
+            vars=vars,
+            max_entries=max_entries,
+        )
+
+    @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+    def drt_apply(
+        plan_id: str,
+        approved_by: str,
+        max_age: str = "24h",
+        allow_drift_pct: float = 0.0,
+        force_guards: bool = False,
+        cursor_value: str | None = None,
+        profile_name: str | None = None,
+        vars: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Apply a plan from ``drt_plan``, only if the world still matches.
+
+        **This writes to the destination. Only call it after a human has
+        reviewed the plan and approved it**, and put it behind your client's
+        approval prompt. It recomputes the plan first (mirrors ``drt apply``,
+        #1217) and refuses, writing nothing, when the plan drifted, was edited,
+        is older than ``max_age``, was made in another environment, or was
+        already applied. A plan is single-use.
+
+        Args:
+            plan_id: The id ``drt_plan`` returned. Plans not fetched with
+                ``drt_plan`` on this project cannot be applied.
+            approved_by: Mandatory. The person who approved this apply; recorded
+                with the run (``run_results.json`` and the plan's claim).
+            max_age: Refuse a plan older than this (``30m``, ``24h``, ``7d``).
+            allow_drift_pct: Proceed if at most this percent of the planned
+                entries drifted (default 0 refuses any difference).
+            force_guards: Apply even though a ``sync.guards`` limit tripped;
+                recorded in the run results. Leave False unless the human
+                explicitly accepted the tripped guard.
+            cursor_value: The cursor override the plan was made with, if any.
+            profile_name: Override the profile (mirrors ``drt apply --profile``).
+            vars: Override project vars, already parsed (mirrors ``--vars``).
+
+        Returns:
+            ``applied`` plus, when written, ``run_id`` and a ``result``; when
+            refused, ``applied: false`` and the reason in ``error``.
+        """
+        return _apply(
+            ctx,
+            plan_id,
+            approved_by,
+            max_age=max_age,
+            allow_drift_pct=allow_drift_pct,
+            force_guards=force_guards,
+            cursor_value=cursor_value,
+            profile_name=profile_name,
             vars=vars,
         )
 
@@ -174,7 +285,7 @@ def create_server(project_dir: Path | None = None) -> Any:
         Args:
             sync_name: Restrict to one sync. If omitted, runs tests for
                 every sync that has tests defined.
-            unit: Run `sync.unit_tests` instead of `sync.tests` (#780) —
+            unit: Run top-level `unit_tests` instead of top-level `tests` (#780) —
                 fixture rows through the transform pipeline, zero
                 credentials, zero network. No destination is touched, so a
                 sync with `destination.lookups` configured reports a failed
@@ -250,6 +361,9 @@ def create_server(project_dir: Path | None = None) -> Any:
     @mcp.tool()
     def drt_state_show(sync_name: str | None = None) -> dict[str, Any]:
         """Show drt's stored state for a sync (watermark + last run).
+
+        Project state may be local, GCS/S3-backed, or warehouse-backed through
+        a Postgres, Snowflake, Databricks, or BigQuery connection profile.
 
         Args:
             sync_name: Sync to inspect. If omitted, returns all syncs.
@@ -329,8 +443,10 @@ def create_server(project_dir: Path | None = None) -> Any:
 
         Args:
             check_connection: Also test connectivity to SQL destinations
-                (Postgres, MySQL, ClickHouse, Snowflake). Adds a
-                'connection_tests' dict keyed by sync name.
+                and every other destination implementing the optional
+                ConnectionTestable capability. Adds a 'connection_tests'
+                dict keyed by sync name; unsupported destinations are marked
+                skipped rather than failed.
             strict: Treat hardcoded-secret warnings as validation errors —
                 a sync with a warning moves from 'valid' into 'errors' and
                 its messages appear there instead of in 'warnings'.
@@ -358,6 +474,9 @@ def create_server(project_dir: Path | None = None) -> Any:
     def drt_get_schema(schema_type: str = "sync") -> dict[str, Any]:
         """Return the JSON Schema for drt configuration files.
 
+        The sync schema reflects installed connector plugins that registered
+        a YAML-usable destination type before this call.
+
         Args:
             schema_type: "sync" for sync YAML schema, "project" for
                          drt_project.yml schema.
@@ -373,7 +492,13 @@ def create_server(project_dir: Path | None = None) -> Any:
 
     @mcp.tool()
     def drt_list_connectors() -> dict[str, list[dict[str, str]]]:
-        """List all available source and destination connectors.
+        """List drt-core's built-in source and destination connector inventory.
+
+        Installed entry-point connectors are loaded and usable by normal MCP
+        sync parsing, but this inventory remains the built-in installation
+        catalog. Use CLI ``drt plugins list --format json`` to inspect plugin
+        package/version/load status and failures; there is no plugin-status MCP
+        tool.
 
         Returns:
             Dict with 'sources' and 'destinations' lists, each containing

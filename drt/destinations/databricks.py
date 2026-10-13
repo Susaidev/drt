@@ -195,6 +195,8 @@ def _rows_per_chunk(n_cols: int) -> int:
 class DatabricksDestination(BaseSqlDestination):
     """Write records into Databricks Delta Lake tables."""
 
+    identifiers_case_insensitive = True
+
     def __init__(self) -> None:
         super().__init__()
         # Databricks-only first-run fall-through: target table doesn't exist
@@ -497,6 +499,13 @@ class DatabricksDestination(BaseSqlDestination):
         ddls = self._resolve_ddls(config)
         effective_mode = "merge" if sync_options.mode == "mirror" else config.mode
 
+        if effective_mode == "insert" and sync_options.uses_fill_empty:
+            raise ValueError(
+                "sync.write_policy: fill_empty needs destination.mode: merge (or sync.mode: "
+                "mirror); mode: insert appends rows and would ignore the policy."
+            )
+        self._validate_write_policy_overrides(sync_options, category_map)
+
         if effective_mode == "insert":
             # Built per contiguous key-signature run (#1091), not once for
             # the whole batch — a column absent from a run is omitted from
@@ -526,6 +535,11 @@ class DatabricksDestination(BaseSqlDestination):
 
             key_clause = " AND ".join([f"target.{k} = source.{k}" for k in config.upsert_key])
             update_cols = [c for c in columns if c not in config.upsert_key]
+            # Delta identifiers are case-insensitive, so use the shared policy
+            # resolver that diff/plan also calls.
+            fill_cols = sync_options.fill_empty_columns(
+                update_cols, case_insensitive=self.identifiers_case_insensitive
+            )
             target_defaults = self._target_column_defaults(cur, config)
             # Reserve all payload names as well as every target name. A target
             # may already have a legitimate user column called
@@ -558,11 +572,33 @@ class DatabricksDestination(BaseSqlDestination):
                 result,
             )
 
-            update_clause = ", ".join(
-                f"{column} = CASE WHEN source.{flags[column]} "
-                f"THEN source.{column} ELSE target.{column} END"
-                for column in update_cols
-            )
+            def sparse_source_expression(column: str) -> str:
+                return (
+                    f"CASE WHEN source.{flags[column]} "
+                    f"THEN source.{column} ELSE target.{column} END"
+                )
+
+            def update_assignment(column: str) -> str:
+                sparse_source = sparse_source_expression(column)
+                if column not in fill_cols:
+                    # Keep the default-policy SQL byte-identical to #1137.
+                    return f"{column} = {sparse_source}"
+                # Decide text-emptiness from the target expression's own SQL
+                # type, independent of optional schema introspection. Every
+                # non-text value (including BINARY and semi-structured values)
+                # is empty only when SQL NULL.
+                target = f"target.{column}"
+                empty_condition = (
+                    f"{target} IS NULL OR ((typeof({target}) LIKE 'string%' OR "
+                    f"typeof({target}) LIKE 'varchar%' OR typeof({target}) LIKE 'char%') "
+                    f"AND TRIM(CAST({target} AS STRING)) = '')"
+                )
+                return (
+                    f"{column} = CASE WHEN {empty_condition} "
+                    f"THEN {sparse_source} ELSE target.{column} END"
+                )
+
+            update_clause = ", ".join(update_assignment(column) for column in update_cols)
             insert_cols = ", ".join(columns)
             insert_defaults = {
                 column: _target_default_expression(target_defaults.get(column.lower())) or "NULL"
@@ -724,6 +760,10 @@ class DatabricksDestination(BaseSqlDestination):
     def supported_modes(self) -> frozenset[str]:
         """Declare the advanced sync modes implemented by Databricks (#1042)."""
         return frozenset({"replace", "mirror"})
+
+    def supported_write_policies(self) -> frozenset[str]:
+        """Databricks honours ``fill_empty`` in the MERGE update clause (#1238)."""
+        return frozenset({"overwrite", "fill_empty"})
 
     def _shadow_name(self, table: str) -> str:
         return f"{table}{_SWAP_SUFFIX}"

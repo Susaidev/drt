@@ -4,7 +4,20 @@ All notable changes to the **drt — Reverse ETL** VS Code extension are documen
 here. This extension versions independently of `drt-core`; each release notes the
 drt-core version its bundled schemas were generated from.
 
-## [0.1.13] - Unreleased
+## [0.1.14] - Unreleased
+
+- Bundled JSON Schemas regenerated from drt-core: `sync.write_policy`
+  (`overwrite` | `fill_empty`) and `sync.write_policy_overrides` write a column only
+  when the destination's value is empty (drt-hub/drt#1238).
+
+- Bundled JSON Schemas regenerated from drt-core: `sync.guards`
+  (`max_creates`, `max_deletes`, `max_delete_pct`, `max_updates_pct`) limits how
+  much a run may change, enforced by `drt apply` (drt-hub/drt#1218).
+
+## [0.1.13] - 2026-10-08
+
+First public release on the VS Code Marketplace and Open VSX. Bundled schemas
+match drt-core 1.1.0.
 
 - Bundled JSON Schemas regenerated from drt-core: `staged_upload` gains an
   optional `rate_limit_key` for explicitly identifying a vendor quota boundary

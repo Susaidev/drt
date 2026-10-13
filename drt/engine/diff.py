@@ -128,6 +128,12 @@ class DiffResult:
     # field ordering.  See the class docstring for why this can be true while
     # ``total_destination_rows`` remains ``None``.
     destination_keys_scanned: bool = False
+    # How many rows the delete pass looked at: the denominator for a delete
+    # percentage (#1218). ``None`` when the strategy cannot report it.
+    delete_baseline: int | None = None
+    # Values a ``write_policy: fill_empty`` run keeps because the destination already holds
+    # one (#1238): counted, never written, and left out of ``updated``.
+    kept_values: int = 0
 
     @staticmethod
     def changed_fields(
@@ -152,6 +158,16 @@ class DiffResult:
                 if col not in new:
                     changed[col] = (old[col], RESET_TO_DESTINATION_DEFAULT)
         return changed
+
+
+def _is_empty(value: Any) -> bool:
+    """Empty for ``write_policy: fill_empty``: NULL, ``''`` or only spaces.
+
+    Mirrors the SQL (``IS NULL OR btrim(col::text) = ''`` / ``TRIM(CAST(col AS CHAR)) = ''``):
+    spaces only, so a CHAR(n) column's padding is irrelevant and a tab or a newline is a
+    value. A non-text value (a number, ``False``) is never empty.
+    """
+    return value is None or (isinstance(value, str) and value.strip(" ") == "")
 
 
 def _writes_full_row(config: DestinationConfig, sync_options: SyncOptions) -> bool:
@@ -238,7 +254,7 @@ def _preview_destination_mirror_deletes(
     upsert_key: list[str],
     source_keys: set[tuple[Any, ...]],
     records: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], str | None]:
+) -> tuple[list[dict[str, Any]], str | None, int | None]:
     """Read-only preview of the rows destination-strategy mirror would DELETE.
 
     The real pass is ``_build_mirror_delete(..., negate=True)``: "DELETE the rows
@@ -275,7 +291,7 @@ def _preview_destination_mirror_deletes(
     try:
         dest_keys = fetch_all_keys(config, upsert_key, scope_cols, scopes)
     except Exception as error:
-        return [], f"{type(error).__name__}: {error}"
+        return [], f"{type(error).__name__}: {error}", None
     if isinstance(config, ClickHouseDestinationConfig):
         comparison_keys = {tuple(str(v) for v in key) for key in source_keys}
 
@@ -290,6 +306,7 @@ def _preview_destination_mirror_deletes(
     return (
         [dict(zip(upsert_key, key)) for key in dest_keys if _normalize(key) not in comparison_keys],
         None,
+        len(dest_keys),
     )
 
 
@@ -299,7 +316,7 @@ def _preview_tracked_mirror_deletes(
     upsert_key: list[str],
     source_keys: set[tuple[Any, ...]],
     records: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], str | None]:
+) -> tuple[list[dict[str, Any]], str | None, int | None]:
     """Read-only preview of the rows tracked mirror would DELETE (#693).
 
     Reads the drt-managed ``_drt_synced_keys`` state for this sync and returns
@@ -321,7 +338,7 @@ def _preview_tracked_mirror_deletes(
     try:
         previous = fetch_tracked_state(config, sync_name)
         if not previous:
-            return [], None
+            return [], None, 0
 
         # Scope filtering (and the final diff) stay inside this same guard
         # (caught in review, #1061): decode_key()/diff_keys() can raise on
@@ -341,11 +358,12 @@ def _preview_tracked_mirror_deletes(
             }
         deleted_keys = diff_keys(previous, list(source_keys))
     except Exception as error:
-        return [], f"{type(error).__name__}: {error}"
+        return [], f"{type(error).__name__}: {error}", None
 
     return (
         [dict(zip(upsert_key, key)) for key in deleted_keys],
         None,
+        len(previous),
     )
 
 
@@ -373,17 +391,26 @@ def _append_only_diff(
     delete_reason: str | None = None
     delete_preview_unavailable_reason: str | None = None
     destination_keys_scanned = False
+    delete_baseline: int | None = None
 
     if sync_options.mode == "mirror":
         assert upsert_key is not None
         if _is_tracked_mirror(sync_options) and records:
-            deleted, delete_preview_unavailable_reason = _preview_tracked_mirror_deletes(
+            (
+                deleted,
+                delete_preview_unavailable_reason,
+                delete_baseline,
+            ) = _preview_tracked_mirror_deletes(
                 config, sync_options, upsert_key, source_keys, records
             )
             delete_reason = "mirror"
         elif _is_destination_mirror(sync_options) and records:
             destination_keys_scanned = True
-            deleted, delete_preview_unavailable_reason = _preview_destination_mirror_deletes(
+            (
+                deleted,
+                delete_preview_unavailable_reason,
+                delete_baseline,
+            ) = _preview_destination_mirror_deletes(
                 config, sync_options, upsert_key, source_keys, records
             )
             delete_reason = "mirror_scan"
@@ -402,6 +429,7 @@ def _append_only_diff(
         supported=True,
         delete_reason=delete_reason if deleted else None,
         delete_preview_unavailable_reason=delete_preview_unavailable_reason,
+        delete_baseline=delete_baseline,
     )
 
 
@@ -462,6 +490,31 @@ def compute_diff(
             fallback_reason=(
                 f"upsert_key not configured for destination '{config.type}' "
                 f"— showing a sample of records that would be written."
+            ),
+        )
+
+    # Identifier folding is a destination behavior, not a config-model
+    # behavior. Resolve the same registered implementation the engine writes
+    # through so override validation and application cannot diverge from the
+    # live path (Snowflake / Databricks fold unquoted identifiers; PostgreSQL
+    # quoted identifiers remain case-sensitive).
+    from drt.connectors import get_destination
+
+    case_insensitive = bool(getattr(get_destination(config), "identifiers_case_insensitive", False))
+    unseen = sync_options.unseen_write_policy_overrides(
+        {c for r in records for c in r}, case_insensitive=case_insensitive
+    )
+    if unseen:
+        # Judged on every record, so unlike a per-batch write it cannot misfire on a column
+        # that is merely absent from one batch; a typo here would apply the default policy.
+        return DiffResult(
+            sample=list(records[:limit]),
+            total_source_rows=len(records),
+            truncated=len(records) > limit,
+            supported=False,
+            fallback_reason=(
+                f"sync.write_policy_overrides names column(s) {unseen} that the source does "
+                "not produce; check the spelling"
             ),
         )
 
@@ -539,17 +592,42 @@ def compute_diff(
     replaced: list[tuple[dict[str, Any], dict[str, Any]]] = []
     writes_full_row = _writes_full_row(config, sync_options)
 
+    kept_values = 0
+    # With fill_empty the writes are order-dependent when a key repeats in the source: the
+    # first row fills an empty column and the next row finds it taken. Track the destination
+    # as the writes would leave it so the diff (and the plan hashes) match the real run.
+    track_writes = sync_options.uses_fill_empty and not writes_full_row
     for record in records:
         key = tuple(record.get(c) for c in upsert_key)
         existing = dest_by_key.get(key)
         if existing is None:
             added.append(record)
-        elif DiffResult.changed_fields(existing, record, include_removed=writes_full_row):
-            if writes_full_row:
-                replaced.append((existing, record))
-            else:
-                updated.append((existing, record))
-        # else: row matches destination exactly — no entry
+            if track_writes:
+                dest_by_key[key] = record  # a later duplicate sees the inserted row
+            continue
+        changed = DiffResult.changed_fields(existing, record, include_removed=writes_full_row)
+        if not changed:
+            continue  # row matches destination exactly — no entry
+        if writes_full_row:
+            replaced.append((existing, record))
+            continue
+        # write_policy: fill_empty (#1238): a column the destination already holds is not
+        # written, so it is kept (and counted) instead of being reported as an update.
+        kept = {
+            column
+            for column in sync_options.fill_empty_columns(
+                changed, case_insensitive=case_insensitive
+            )
+            if not _is_empty(existing.get(column))
+        }
+        if kept:
+            kept_values += len(kept)
+            record = {**record, **{column: existing.get(column) for column in kept}}
+            if not DiffResult.changed_fields(existing, record):
+                continue  # every difference was a kept value: nothing is written
+        updated.append((existing, record))
+        if track_writes:
+            dest_by_key[key] = {**existing, **record}
 
     # Deleted is meaningful only when the engine would actually drop rows.
     # In replace mode, the destination table is rebuilt; rows that aren't
@@ -566,22 +644,35 @@ def compute_diff(
     delete_reason: str | None = None
     delete_preview_unavailable_reason: str | None = None
     destination_keys_scanned = False
+    delete_baseline = None
     if sync_options.mode == "replace":
-        deleted = [row for key, row in dest_by_key.items() if key not in source_keys]
+        # Physical rows, not distinct keys: replace removes every destination row
+        # whose key the source lacks, including duplicates of one key, and a
+        # delete guard must not undercount a table without a unique key.
+        deleted = [
+            row for row in dest_rows if tuple(row.get(c) for c in upsert_key) not in source_keys
+        ]
         delete_reason = "replace"
+        delete_baseline = len(dest_rows)
     # ``and records`` on both mirror legs: ``_finalize_mirror`` returns early
     # when no key was observed (``if not self._mirror_keys: return None``), and
     # that guard sits *above* the tracked dispatch — so a transient empty source
     # deletes nothing, on either strategy. Previewing a full wipe would tell the
     # operator the opposite of what the run would do.
     elif _is_tracked_mirror(sync_options) and records:
-        deleted, delete_preview_unavailable_reason = _preview_tracked_mirror_deletes(
-            config, sync_options, upsert_key, source_keys, records
-        )
+        (
+            deleted,
+            delete_preview_unavailable_reason,
+            delete_baseline,
+        ) = _preview_tracked_mirror_deletes(config, sync_options, upsert_key, source_keys, records)
         delete_reason = "mirror"
     elif _is_destination_mirror(sync_options) and records:
         destination_keys_scanned = True
-        deleted, delete_preview_unavailable_reason = _preview_destination_mirror_deletes(
+        (
+            deleted,
+            delete_preview_unavailable_reason,
+            delete_baseline,
+        ) = _preview_destination_mirror_deletes(
             config, sync_options, upsert_key, source_keys, records
         )
         delete_reason = "mirror_scan"
@@ -614,4 +705,6 @@ def compute_diff(
         delete_reason=delete_reason if deleted else None,
         delete_preview_unavailable_reason=delete_preview_unavailable_reason,
         writes_full_row=writes_full_row,
+        delete_baseline=delete_baseline,
+        kept_values=kept_values,
     )

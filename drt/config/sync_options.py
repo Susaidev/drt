@@ -6,10 +6,12 @@ the three ``destinations_*`` modules and consumed by :class:`SyncConfig`.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Annotated, Any, Literal, get_args
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Discriminator,
     Field,
     PrivateAttr,
@@ -171,6 +173,31 @@ class MaskRule(BaseModel):
 MaskSpec = Literal["hash", "redact"] | MaskRule
 
 
+class GuardsConfig(BaseModel):
+    """``sync.guards`` — limits on how much one run may change (#1218).
+
+    Evaluated against the change set a plan computes: ``drt plan`` reports a
+    trip, ``drt apply`` refuses to write (``--force-guards`` overrides, loudly).
+    ``drt run`` does not enforce them yet.
+
+    - ``max_creates`` — rows to be created (including append-only inserts).
+    - ``max_deletes`` — rows to be deleted (mirror / replace).
+    - ``max_delete_pct`` — deletes as a percentage of the rows the delete pass
+      looked at (destination keys, tracked keys, or the table for ``replace``).
+      A strategy that cannot report that total trips the guard rather than
+      silently passing.
+    - ``max_updates_pct`` — updates as a percentage of the source rows.
+    """
+
+    # A safety setting must not ignore a typo such as ``max_delete: 5``.
+    model_config = ConfigDict(extra="forbid")
+
+    max_creates: int | None = Field(default=None, ge=0)
+    max_deletes: int | None = Field(default=None, ge=0)
+    max_delete_pct: float | None = Field(default=None, ge=0, le=100)
+    max_updates_pct: float | None = Field(default=None, ge=0, le=100)
+
+
 class MirrorConfig(BaseModel):
     """``sync.mirror`` — mirror-mode delete behaviour (#686).
 
@@ -320,6 +347,19 @@ class SyncOptions(BaseModel):
     # fails fast on destinations that don't implement it (see the engine's
     # MatchPolicyCapable guard). Prior art: Census / Hightouch sync behaviours.
     match_policy: Literal["upsert", "update_only", "create_only"] = "upsert"
+    # Column write policy (#1238), the per-column sibling of match_policy:
+    #   - "overwrite" (default): an upsert replaces every non-key column.
+    #   - "fill_empty": write a column only when the destination's current value is
+    #     NULL or an empty string; a value that is already there is never replaced
+    #     (enrichment: the warehouse value is a best guess, an existing value may have
+    #     been entered or verified by someone). New rows are still inserted in full.
+    # ``write_policy_overrides`` sets a column's policy against the default, either
+    # way round. Rejected for mode: replace and on destinations that cannot honour it
+    # (see the engine's WritePolicyCapable guard).
+    write_policy: Literal["overwrite", "fill_empty"] = "overwrite"
+    write_policy_overrides: dict[str, Literal["overwrite", "fill_empty"]] = Field(
+        default_factory=dict
+    )
     cursor_field: str | None = None  # required when mode=incremental
     # Incremental strategy (#755): "cursor" (default) filters server-side via
     # cursor_field/watermark, same as always. "diff" instead snapshots the
@@ -368,6 +408,7 @@ class SyncOptions(BaseModel):
     dlq: DLQConfig | None = None
     # Mirror-mode delete behaviour (#686). None = destination strategy (#340).
     mirror: MirrorConfig | None = None
+    guards: GuardsConfig | None = None
     # Per-record dedup key for the warehouse-backed idempotency ledger
     # (#1099), Jinja template read against the record as it reaches the
     # destination (after field_mappings/mask, same seam as metadata_columns
@@ -496,6 +537,55 @@ class SyncOptions(BaseModel):
         if self.replace_strategy == "swap" and self.mode != "replace":
             raise ValueError("replace_strategy='swap' requires mode='replace'.")
         return self
+
+    @model_validator(mode="after")
+    def _check_write_policy_mode(self) -> SyncOptions:
+        if self.uses_fill_empty and self.mode == "replace":
+            raise ValueError(
+                "sync.write_policy: fill_empty is not compatible with mode: replace — replace "
+                "rebuilds the table, so there is no existing value to keep."
+            )
+        return self
+
+    @property
+    def uses_fill_empty(self) -> bool:
+        """True when any column is written fill-only (the default or an override)."""
+        return (
+            self.write_policy == "fill_empty"
+            or "fill_empty" in self.write_policy_overrides.values()
+        )
+
+    def fill_empty_columns(
+        self, columns: Iterable[str], *, case_insensitive: bool = False
+    ) -> set[str]:
+        """The subset of ``columns`` written only when the destination value is empty.
+
+        ``case_insensitive`` follows the destination's identifier semantics so
+        live writes and diff/plan resolve override names the same way.
+        """
+        overrides = (
+            {name.lower(): policy for name, policy in self.write_policy_overrides.items()}
+            if case_insensitive
+            else self.write_policy_overrides
+        )
+        return {
+            column
+            for column in columns
+            if overrides.get(column.lower() if case_insensitive else column, self.write_policy)
+            == "fill_empty"
+        }
+
+    def unseen_write_policy_overrides(
+        self, seen_columns: Iterable[str], *, case_insensitive: bool = False
+    ) -> list[str]:
+        """Override columns that no written record carried: almost certainly a typo, and
+        a typo on a ``fill_empty`` override would silently overwrite."""
+        seen = {column.lower() if case_insensitive else column for column in seen_columns}
+        return sorted(
+            column
+            for column in self.write_policy_overrides
+            if (column.lower() if case_insensitive else column) not in seen
+        )
 
     @model_validator(mode="after")
     def _check_match_policy_mode(self) -> SyncOptions:
@@ -834,6 +924,13 @@ _BUILTIN_DESTINATION_TAGS: frozenset[str] = frozenset(
     if isinstance(meta, Tag) and (tag := meta.tag) != GENERIC_DESTINATION_TAG
 )
 
+# Built-in SQL destinations that implement ``sync.write_policy: fill_empty``.
+# Keep the destination-mode compatibility rule here, where both halves of the
+# config are visible, so validation, plan, dry-run, and a real run all agree.
+_WRITE_POLICY_SQL_DESTINATION_TYPES = frozenset(
+    {"postgres", "mysql", "snowflake", "databricks", "bigquery"}
+)
+
 
 class SyncConfig(BaseModel):
     name: str
@@ -847,6 +944,27 @@ class SyncConfig(BaseModel):
     # queries the real destination after a sync has run.
     unit_tests: list[UnitTest] = Field(default_factory=list)
     alerts: AlertsConfig | None = None
+
+    @model_validator(mode="after")
+    def _check_write_policy_destination_mode(self) -> SyncConfig:
+        if not self.sync.uses_fill_empty:
+            return self
+
+        destination_type = destination_type_of(self.destination)
+        if destination_type not in _WRITE_POLICY_SQL_DESTINATION_TYPES:
+            return self
+
+        # PostgreSQL and MySQL always use their upsert statements. The three
+        # warehouse destinations expose an append-only insert mode, except
+        # that sync.mode: mirror deliberately forces their merge path.
+        destination_mode = getattr(self.destination, "mode", "merge")
+        if self.sync.mode != "mirror" and destination_mode == "insert":
+            raise ValueError(
+                "sync.write_policy: fill_empty needs destination.mode: merge "
+                "(or sync.mode: mirror); destination.mode: insert appends rows "
+                "and would ignore the policy."
+            )
+        return self
 
     @model_validator(mode="after")
     def _inject_sync_name(self) -> SyncConfig:

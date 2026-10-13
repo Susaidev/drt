@@ -113,6 +113,24 @@ def _apply_watermark_lag(value: str, lag: str | int) -> str:
     return _stringify_cursor_value(lagged)
 
 
+def _check_write_policy_supported(sync_options: Any, destination: Any) -> None:
+    """Fail fast on ``fill_empty`` for a destination that cannot honour it (#1238)."""
+    from drt.destinations.base import WritePolicyCapable
+
+    if not sync_options.uses_fill_empty:
+        return
+    supported: frozenset[str] = frozenset()
+    if isinstance(destination, WritePolicyCapable):
+        supported = destination.supported_write_policies()
+    if "fill_empty" not in supported:
+        raise ValueError(
+            f"sync.write_policy: fill_empty is not supported by {type(destination).__name__}. "
+            "It writes a column only when the destination's value is empty, which this "
+            "destination cannot do; remove write_policy / write_policy_overrides, or use a "
+            "destination that supports it."
+        )
+
+
 def _check_match_policy_supported(
     match_policy: str, destination: Destination | StagedDestination
 ) -> None:
@@ -136,8 +154,8 @@ def _check_match_policy_supported(
             f"sync.match_policy: {match_policy} is not supported by "
             f"{dest_name}. Supported here: "
             f"{', '.join(sorted(supported)) or 'upsert only'}. "
-            "match_policy currently ships on the Postgres destination "
-            "(update_only / create_only); other destinations follow (#757)."
+            "match_policy currently ships on the Postgres, MySQL, HubSpot, and Intercom "
+            "destinations (update_only / create_only); other destinations follow (#757)."
         )
 
 
@@ -620,6 +638,7 @@ def _run_sync_body(
     # inside the engine boundary.
     _check_mode_supported(sync.sync.mode, destination)
     _check_match_policy_supported(sync.sync.match_policy, destination)
+    _check_write_policy_supported(sync.sync, destination)
     # SyncOptions can be reused across invocations. Reset the private
     # finalize-time signal before extraction, then flip it only when the
     # cooperative stop path actually truncates the source stream.
@@ -1030,11 +1049,13 @@ def _run_sync_body(
                     load_span.set_attribute("load.failed", result.failed)
                     load_span.set_attribute("load.skipped", result.skipped)
                     load_span.set_attribute("load.skipped_no_match", result.skipped_no_match)
+                    load_span.set_attribute("load.kept_values", result.kept_values)
                 load_batch_index += 1
                 total_result.success += result.success
                 total_result.failed += result.failed
                 total_result.skipped += result.skipped
                 total_result.skipped_no_match += result.skipped_no_match
+                total_result.kept_values += result.kept_values
                 total_result.errors.extend(result.errors)
                 total_result.row_errors.extend(getattr(result, "row_errors", []))
 
@@ -1151,6 +1172,16 @@ def _run_sync_body(
         extract_span.set_attribute("extract.rows_extracted", total_result.rows_extracted)
         extract_span.end()
 
+    # A removal-only snapshot diff has no added/changed records, so the batch
+    # loop above never gets a chance to observe a shutdown request. Check once
+    # more before any finalize hook: destructive mirror deletes and diff
+    # baseline promotion must both remain off for an interrupted run, even
+    # when there was no destination load batch at all.
+    if stop_event is not None and stop_event.is_set() and not total_result.interrupted:
+        total_result.interrupted = True
+        sync.sync._interrupted = True
+        observer.on_interrupted(sync.name, batches_processed)
+
     # Finalize staged destinations (upload file, trigger job, poll).
     # finalize() is authoritative for staged success/failed counts —
     # stage() only buffers, so records aren't "successful" until finalize.
@@ -1197,17 +1228,19 @@ def _run_sync_body(
 
     # Promote this run's snapshot to be the next diff's baseline (#755) —
     # only after a run with zero row failures across extraction and any
-    # destination finalize step above, and never for a dry run. On partial
-    # failure the baseline is deliberately left stale, so the same rows are
-    # reclassified as added/changed again next run rather than risking a
-    # row that never reached the destination being treated as delivered —
-    # same conservative posture as #920's/#955's reconcile-on-next-run fixes.
+    # destination finalize step above, and never for a dry or interrupted
+    # run. On partial failure/interruption the baseline is deliberately left
+    # stale, so the same rows are reclassified as added/changed/removed again
+    # next run rather than risking a row or removal that never reached the
+    # destination being treated as delivered — same conservative posture as
+    # #920's/#955's reconcile-on-next-run fixes.
     # A --limit run delivers only a prefix of the diff, so promoting the full
     # snapshot would make the skipped rows look delivered on the next run.
     if (
         sync.sync.incremental_strategy == "diff"
         and not dry_run
         and total_result.failed == 0
+        and not total_result.interrupted
         and extract_limit is None
         and isinstance(source, SnapshotDiffSource)
     ):

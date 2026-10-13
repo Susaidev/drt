@@ -93,27 +93,40 @@ destination:
   ...
 ```
 
-drt loads the batch into a temp table `<table>_drt_tmp` (`load_table_from_json`), runs a single
+drt partitions each batch into contiguous runs whose records have the same
+exact key set. For each run it loads only that run's fields into the
+execution-unique temp table `<table>_drt_tmp_<run-id>`
+(`load_table_from_json`) and runs
 
 ```sql
 MERGE `project.dataset.table` T
-USING `project.dataset.table_drt_tmp` S
+USING `project.dataset.table_drt_tmp_a1b2c3d4` S
 ON T.user_id = S.user_id
 WHEN MATCHED THEN UPDATE SET <non-key columns>
 WHEN NOT MATCHED THEN INSERT (...) VALUES (...)
 ```
 
-then drops the temp table. When the target exists and contains every batch
-column, drt supplies those target fields as the temp-table load schema instead
-of relying on autodetect. This preserves types for all-`NULL` columns (which
-BigQuery otherwise detects as `STRING`). A missing target or a batch column not
-yet present in the target retains BigQuery's existing autodetect behavior.
+before loading the next signature run into the same temp table. A field omitted
+from a record is therefore absent from that run's UPDATE and INSERT lists: an
+UPDATE leaves the existing target value alone, and an INSERT lets the target's
+normal omitted-column behavior apply. A field present with an explicit `null`
+remains part of the run and writes SQL `NULL`.
+
+When the target exists and contains every run column, drt supplies those target
+fields as the temp-table load schema instead of relying on autodetect. This
+preserves types for all-`NULL` columns (which BigQuery otherwise detects as
+`STRING`). A missing target or a run column not yet present in the target
+retains BigQuery's existing autodetect behavior. The per-run-id suffix prevents
+overlapping sync executions against one target from sharing staging data.
 Composite keys are supported (`upsert_key: [tenant_id, user_id]` → AND-joined
 `ON`). When every column is in `upsert_key`, the `WHEN MATCHED` UPDATE is
-skipped (effectively insert-if-not-exists). Because BigQuery load + MERGE are
-**job-level** operations, merge error handling is **batch-level** (the whole
-batch succeeds or fails) — coarser than the per-row staging used by the
-Snowflake / Databricks destinations.
+skipped (effectively insert-if-not-exists). Because each BigQuery load + MERGE
+pair is independently committed, error handling is **signature-run-level**. On
+`on_error: skip`, every record in a failed run gets a `RowError` at its original
+batch index and later runs continue. On `on_error: fail`, processing stops, but
+earlier completed runs cannot be rolled back and remain committed. This is
+coarser than the per-row staging used by the Snowflake / Databricks
+destinations.
 
 ## Sync modes
 
@@ -123,7 +136,7 @@ Snowflake / Databricks destinations.
 | `incremental` | Watermark-based — extracts rows with `cursor_field > last_value`, writes via `config.mode`. |
 | `upsert` | Same as `incremental` with `upsert_key` enforced. |
 | `replace` | Rebuilds the table through load jobs. `replace_strategy: truncate` writes the first batch with `WRITE_TRUNCATE` and later batches with `WRITE_APPEND`; `swap` builds a shadow and atomically copies it over the target at end of sync. |
-| `mirror` | Forces the MERGE path, stages observed keys, then deletes target rows not present in the staged key table. Requires `destination.upsert_key`. |
+| `mirror` | Forces the MERGE path. The default strategy stages observed keys and deletes target rows not present in that table; `strategy: diff` stages and deletes only keys the source snapshot classified as removed. Requires `destination.upsert_key`. |
 
 ### Replace details
 
@@ -166,14 +179,16 @@ sync:
   mode: mirror
 ```
 
-Each source batch is loaded to `<table>_drt_tmp`. On the first batch, drt creates
+Each source batch is split into the same signature-scoped
+`<table>_drt_tmp_<run-id>` load/MERGE jobs described above. Before those jobs,
+drt stages the whole batch's keys exactly once, so sparse signature runs cannot
+leave mirror deletion with an incomplete observed-key set. On the first batch, drt creates
 an empty `<table>__drt_mirror_keys_<run-id>` table by selecting the configured
 key and scope columns from the target with `WHERE FALSE`, then loads each
-batch's observed key/scope values into that typed table before the existing
-MERGE runs. One target-schema lookup per batch supplies explicit types to both
-the MERGE temp load and mirror-key load, avoiding BigQuery autodetect choosing
-`STRING` when a nullable target column is all `NULL`. After all batches, drt
-issues one anti-join delete:
+batch's observed key/scope values into that typed table. One target-schema
+lookup per batch supplies explicit types to every signature temp load and the
+mirror-key load, avoiding BigQuery autodetect choosing `STRING` when a nullable
+target column is all `NULL`. After all batches, drt issues one anti-join delete:
 
 ```sql
 DELETE FROM `project.dataset.table` AS T
@@ -187,14 +202,34 @@ WHERE NOT EXISTS (
 This avoids a giant value-interpolated `IN (...)` list: record values reach
 BigQuery through the load job, while generated SQL contains only validated,
 backtick-quoted identifiers. Composite keys and `sync.mirror.scope` are
-supported. An empty source does not delete anything. `mirror.strategy:
-tracked` is not yet supported; `mirror.strategy: diff` also fails fast for now
-(the BigQuery diff source exists, but the destination does not yet consume its removed keys).
-An interrupted run also skips the anti-join delete because its staged keys
-cover only a processed prefix; the unconditional write-state reset drops that
-run's key table. The per-run suffix keeps overlapping invocations isolated.
+supported by the default destination strategy; scope matching uses NULL-safe
+`TO_JSON_STRING` equality. An empty source does not delete anything.
+`mirror.strategy: tracked` is not yet supported. An interrupted run also skips
+the anti-join delete because its staged keys cover only a processed prefix;
+the unconditional write-state reset drops that run's key table, and an
+interrupted diff run does not promote its source snapshot baseline. The
+per-run suffix keeps overlapping invocations isolated.
 Mirror mode rejects partition-decorated targets such as `events$20261005`;
 target the base table instead.
+
+For a BigQuery diff source, exact source-side removals can drive mirror deletes
+without scanning the destination or staging every unchanged source key:
+
+```yaml
+sync:
+  mode: mirror
+  incremental_strategy: diff
+  mirror:
+    strategy: diff
+```
+
+Added and changed rows still use the normal MERGE path. At finalize time, drt
+loads the removed keys into a target-typed, per-run
+`<table>__drt_mirror_keys_diff_<run-id>` table and deletes matching target rows
+with an `EXISTS` join. Removal-only runs therefore still perform the delete;
+composite keys are AND-joined, and no value-interpolated `IN (...)` list is
+generated. `strategy: diff` does not accept `mirror.scope` because its removed
+key list is already the exact row-level deletion set.
 
 Both MERGE and mirror use query-job DML. Rows previously written with the
 legacy streaming insert API can remain in BigQuery's streaming buffer and be
@@ -210,7 +245,7 @@ Each run materializes the full model result in `_drt_snapshot_<sync_name>_<diges
 source profile's `managed_schema`, then classifies added, changed, and removed rows with
 server-side joins on `destination.upsert_key`. Added and changed rows follow the normal upsert
 path; removed keys are exposed through `SyncResult.diff_removed_keys`, power
-`mirror.strategy: diff` where the destination supports it, and appear in `--dry-run --diff`
+`mirror.strategy: diff`, and appear in `--dry-run --diff`
 deletion previews.
 
 ```yaml

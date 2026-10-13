@@ -105,9 +105,11 @@ def _mocked_bq_modules(
     }
 
 
-def _schema_field(name: str) -> MagicMock:
+def _schema_field(name: str, field_type: str = "STRING", mode: str = "NULLABLE") -> MagicMock:
     field = MagicMock()
     field.name = name
+    field.field_type = field_type
+    field.mode = mode
     return field
 
 
@@ -288,19 +290,19 @@ class TestBigQueryDestinationLoad:
         client.load_table_from_json.assert_called_once()
         assert client.load_table_from_json.call_args.args == (
             records,
-            "my-proj.analytics.user_scores_drt_tmp",
+            "my-proj.analytics.user_scores_drt_tmp_a1b2c3d4",
         )
         merge = next(s for s in _sqls(client) if "MERGE" in s)
         assert "MERGE `my-proj.analytics.user_scores` T" in merge
-        assert "USING `my-proj.analytics.user_scores_drt_tmp` S" in merge
+        assert "USING `my-proj.analytics.user_scores_drt_tmp_a1b2c3d4` S" in merge
         assert "ON T.`id` = S.`id`" in merge
         assert "WHEN MATCHED THEN UPDATE SET `score` = S.`score`" in merge
         assert "WHEN NOT MATCHED THEN INSERT" in merge
         client.delete_table.assert_called_once_with(
-            "my-proj.analytics.user_scores_drt_tmp", not_found_ok=True
+            "my-proj.analytics.user_scores_drt_tmp_a1b2c3d4", not_found_ok=True
         )
 
-    def test_merge_temp_load_uses_target_schema_in_batch_column_order(self) -> None:
+    def test_merge_temp_load_uses_target_schema_in_each_run_column_order(self) -> None:
         client = _fake_client()
         id_field = _schema_field("id")
         score_field = _schema_field("score")
@@ -319,11 +321,329 @@ class TestBigQueryDestinationLoad:
         assert result.success == 2
         client.get_table.assert_called_once_with("my-proj.analytics.user_scores")
         bq = modules["google.cloud.bigquery"]
+        assert bq.LoadJobConfig.call_args_list == [
+            call(
+                write_disposition=bq.WriteDisposition.WRITE_TRUNCATE,
+                schema=[id_field, score_field],
+                autodetect=False,
+            ),
+            call(
+                write_disposition=bq.WriteDisposition.WRITE_TRUNCATE,
+                schema=[id_field, score_field, other_field],
+                autodetect=False,
+            ),
+        ]
+
+    def test_merge_fill_empty_uses_target_types_and_case_folded_override(self) -> None:
+        client = _fake_client()
+        fields = {
+            "id": _schema_field("id", "INT64"),
+            "industry": _schema_field("industry", "STRING"),
+            "score": _schema_field("score", "INT64"),
+        }
+        client.get_table.return_value.schema = list(fields.values())
+        modules = _mocked_bq_modules(client)
+        records = [{"id": 1, "industry": "Software", "score": 99}]
+
+        with patch.dict("sys.modules", modules):
+            result = BigQueryDestination().load(
+                records,
+                _config(mode="merge", upsert_key=["id"]),
+                _options(
+                    write_policy="fill_empty",
+                    write_policy_overrides={"SCORE": "overwrite"},
+                ),
+            )
+
+        assert result.success == 1
+        bq = modules["google.cloud.bigquery"]
         bq.LoadJobConfig.assert_called_once_with(
             write_disposition=bq.WriteDisposition.WRITE_TRUNCATE,
-            schema=[id_field, score_field, other_field],
+            schema=[fields["id"], fields["industry"], fields["score"]],
             autodetect=False,
         )
+        merge = next(sql for sql in _sqls(client) if sql.startswith("MERGE"))
+        assert (
+            "`industry` = CASE WHEN T.`industry` IS NULL OR TRIM(T.`industry`) = '' "
+            "THEN S.`industry` ELSE T.`industry` END"
+        ) in merge
+        assert "`score` = S.`score`" in merge
+        assert merge.count("CASE WHEN") == 1
+
+    def test_merge_fill_empty_sparse_run_omits_the_absent_column(self) -> None:
+        client = _fake_client()
+        client.get_table.return_value.schema = [
+            _schema_field("id", "INT64"),
+            _schema_field("industry", "STRING"),
+            _schema_field("score", "INT64"),
+        ]
+        modules = _mocked_bq_modules(client)
+        records: list[dict[str, Any]] = [
+            {"id": 1, "industry": "Software", "score": 10},
+            {"id": 2, "score": 20},
+        ]
+
+        with patch.dict("sys.modules", modules):
+            result = BigQueryDestination().load(
+                records,
+                _config(mode="merge", upsert_key=["id"]),
+                _options(write_policy="fill_empty"),
+            )
+
+        assert result.success == 2
+        merges = [sql for sql in _sqls(client) if sql.startswith("MERGE")]
+        assert len(merges) == 2
+        assert "TRIM(T.`industry`)" in merges[0]
+        assert "`industry`" not in merges[1]
+        assert "`score` = CASE WHEN T.`score` IS NULL" in merges[1]
+
+    def test_merge_fill_empty_non_string_types_are_null_only(self) -> None:
+        client = _fake_client()
+        client.get_table.return_value.schema = [
+            _schema_field("id", "INT64"),
+            _schema_field("name", "STRING"),
+            _schema_field("payload", "BYTES"),
+            _schema_field("document", "JSON"),
+            _schema_field("details", "RECORD"),
+            _schema_field("tags", "STRING", "REPEATED"),
+        ]
+        modules = _mocked_bq_modules(client)
+        records = [
+            {
+                "id": 1,
+                "name": "new",
+                "payload": "c291cmNl",
+                "document": {"value": "new"},
+                "details": {"value": "new"},
+                "tags": ["new"],
+            }
+        ]
+
+        with patch.dict("sys.modules", modules):
+            BigQueryDestination().load(
+                records,
+                _config(mode="merge", upsert_key=["id"]),
+                _options(write_policy="fill_empty"),
+            )
+
+        merge = next(sql for sql in _sqls(client) if sql.startswith("MERGE"))
+        assert "TRIM(T.`name`) = ''" in merge
+        for column in ("payload", "document", "details", "tags"):
+            assert (
+                f"`{column}` = CASE WHEN T.`{column}` IS NULL "
+                f"THEN S.`{column}` ELSE T.`{column}` END"
+            ) in merge
+            assert f"TRIM(T.`{column}`)" not in merge
+
+    def test_merge_fill_empty_schema_unavailable_is_null_only(self) -> None:
+        client = _fake_client()
+        client.get_table.side_effect = _NotFound("absent")
+        modules = _mocked_bq_modules(client)
+
+        with patch.dict("sys.modules", modules):
+            result = BigQueryDestination().load(
+                [{"id": 1, "industry": "Software"}],
+                _config(mode="merge", upsert_key=["id"]),
+                _options(write_policy="fill_empty"),
+            )
+
+        assert result.success == 1
+        merge = next(sql for sql in _sqls(client) if sql.startswith("MERGE"))
+        assert (
+            "`industry` = CASE WHEN T.`industry` IS NULL THEN S.`industry` ELSE T.`industry` END"
+        ) in merge
+        assert "TRIM(" not in merge
+
+    def test_default_merge_sql_is_byte_identical_to_sparse_merge(self) -> None:
+        client = _fake_client()
+        modules = _mocked_bq_modules(client)
+
+        with patch.dict("sys.modules", modules):
+            BigQueryDestination().load(
+                [{"id": 1, "score": 10, "note": "set"}],
+                _config(mode="merge", upsert_key=["id"]),
+                _options(),
+            )
+
+        merge = next(sql for sql in _sqls(client) if sql.startswith("MERGE"))
+        assert merge == (
+            "MERGE `my-proj.analytics.user_scores` T "
+            "USING `my-proj.analytics.user_scores_drt_tmp_a1b2c3d4` S "
+            "ON T.`id` = S.`id` "
+            "WHEN MATCHED THEN UPDATE SET `score` = S.`score`, `note` = S.`note` "
+            "WHEN NOT MATCHED THEN INSERT (`id`, `score`, `note`) "
+            "VALUES (S.`id`, S.`score`, S.`note`)"
+        )
+
+    def test_write_policy_override_typo_is_rejected_before_any_write(self) -> None:
+        client = _fake_client()
+        client.get_table.return_value.schema = [
+            _schema_field("ID", "INT64"),
+            _schema_field("INDUSTRY", "STRING"),
+        ]
+        modules = _mocked_bq_modules(client)
+
+        with (
+            patch.dict("sys.modules", modules),
+            pytest.raises(
+                ValueError,
+                match=r"\['industy'\].*not columns of the destination",
+            ),
+        ):
+            BigQueryDestination().load(
+                [{"id": 1, "industry": "Software"}],
+                _config(mode="merge", upsert_key=["id"]),
+                _options(write_policy_overrides={"industy": "fill_empty"}),
+            )
+
+        client.load_table_from_json.assert_not_called()
+        client.query.assert_not_called()
+        client.delete_table.assert_not_called()
+
+    def test_fill_empty_is_refused_in_insert_mode_before_client(self) -> None:
+        with pytest.raises(ValueError, match="needs destination.mode: merge"):
+            BigQueryDestination().load(
+                [{"id": 1, "industry": "Software"}],
+                _config(mode="insert"),
+                _options(write_policy="fill_empty"),
+            )
+
+    def test_mirror_fill_empty_merges_before_unchanged_delete_pass(self) -> None:
+        client = _fake_client()
+        client.get_table.return_value.schema = [
+            _schema_field("id", "INT64"),
+            _schema_field("industry", "STRING"),
+        ]
+        modules = _mocked_bq_modules(client)
+        destination = BigQueryDestination()
+        config = _config(mode="insert", upsert_key=["id"])
+        options = _options(mode="mirror", write_policy="fill_empty")
+
+        with patch.dict("sys.modules", modules):
+            result = destination.load([{"id": 1, "industry": "Software"}], config, options)
+            finalized = destination.finalize_sync(config, options)
+
+        assert result.success == 1 and finalized is not None
+        sqls = _sqls(client)
+        merge = next(sql for sql in sqls if sql.startswith("MERGE"))
+        delete = next(sql for sql in sqls if sql.startswith("DELETE FROM"))
+        assert "TRIM(T.`industry`) = ''" in merge
+        assert "CASE WHEN" not in delete
+
+    def test_sparse_merge_writes_later_field_and_distinguishes_none_from_omitted(self) -> None:
+        client = _fake_client()
+        fields = {name: _schema_field(name) for name in ("id", "name", "note")}
+        client.get_table.return_value.schema = list(fields.values())
+        modules = _mocked_bq_modules(client)
+        records = [
+            {"id": 1, "name": "omitted"},
+            {"id": 2, "name": "later", "note": "written"},
+            {"id": 3, "name": "explicit-null", "note": None},
+        ]
+        options = _options()
+        options._query_tags = {"sync": "sparse", "run_id": "r"}
+
+        with patch.dict("sys.modules", modules):
+            result = BigQueryDestination().load(
+                records,
+                _config(mode="merge", upsert_key=["id"]),
+                options,
+            )
+
+        assert result.success == 3
+        assert [c.args[0] for c in client.load_table_from_json.call_args_list] == [
+            [records[0]],
+            records[1:],
+        ]
+        merge_sqls = [sql for sql in _sqls(client) if sql.startswith("MERGE")]
+        assert len(merge_sqls) == 2
+        assert "`note`" not in merge_sqls[0]
+        assert "`note` = S.`note`" in merge_sqls[1]
+        assert "INSERT (`id`, `name`, `note`)" in merge_sqls[1]
+        # Explicit None stays present in the staged payload; omission alone
+        # starts a different signature run and excludes note from its SQL.
+        assert "note" in client.load_table_from_json.call_args_list[1].args[0][1]
+        assert client.load_table_from_json.call_args_list[1].args[0][1]["note"] is None
+        bq = modules["google.cloud.bigquery"]
+        assert all(
+            c.kwargs["labels"] == {"sync": "sparse", "run_id": "r"}
+            for c in bq.LoadJobConfig.call_args_list
+        )
+        assert bq.QueryJobConfig.call_args_list == [
+            call(labels={"sync": "sparse", "run_id": "r"}),
+            call(labels={"sync": "sparse", "run_id": "r"}),
+        ]
+
+    def test_sparse_merge_preserves_order_when_signatures_alternate(self) -> None:
+        client = _fake_client()
+        modules = _mocked_bq_modules(client)
+        records = [
+            {"id": 1, "score": 1},
+            {"id": 1, "note": "middle"},
+            {"id": 1, "score": 3},
+        ]
+
+        with patch.dict("sys.modules", modules):
+            result = BigQueryDestination().load(
+                records,
+                _config(mode="merge", upsert_key=["id"]),
+                _options(),
+            )
+
+        assert result.success == 3
+        assert [c.args[0] for c in client.load_table_from_json.call_args_list] == [
+            [records[0]],
+            [records[1]],
+            [records[2]],
+        ]
+        merge_sqls = [sql for sql in _sqls(client) if sql.startswith("MERGE")]
+        assert ["`score`" in sql for sql in merge_sqls] == [True, False, True]
+        assert ["`note`" in sql for sql in merge_sqls] == [False, True, False]
+
+    def test_sparse_merge_skip_reports_failed_run_and_continues(self) -> None:
+        client = _fake_client()
+        failed = MagicMock()
+        failed.result.side_effect = RuntimeError("middle run failed")
+        client.query.side_effect = [MagicMock(), failed, MagicMock()]
+        modules = _mocked_bq_modules(client)
+        records = [{"id": 1}, {"id": 2, "note": "bad"}, {"id": 3}]
+
+        with patch.dict("sys.modules", modules):
+            result = BigQueryDestination().load(
+                records,
+                _config(mode="merge", upsert_key=["id"]),
+                _options(on_error="skip"),
+            )
+
+        assert result.success == 2
+        assert result.failed == 1
+        assert [error.batch_index for error in result.row_errors] == [1]
+        assert result.row_errors[0].error_message == "middle run failed"
+        assert client.query.call_count == 3
+
+    def test_sparse_merge_fail_stops_after_failed_run_but_prior_run_is_committed(self) -> None:
+        client = _fake_client()
+        failed = MagicMock()
+        failed.result.side_effect = RuntimeError("middle run failed")
+        client.query.side_effect = [MagicMock(), failed]
+        modules = _mocked_bq_modules(client)
+        records = [{"id": 1}, {"id": 2, "note": "bad"}, {"id": 3}]
+
+        with patch.dict("sys.modules", modules):
+            with pytest.raises(RuntimeError, match="middle run failed"):
+                BigQueryDestination().load(
+                    records,
+                    _config(mode="merge", upsert_key=["id"]),
+                    _options(on_error="fail"),
+                )
+
+        # BigQuery jobs autocommit: the first MERGE cannot be rolled back, and
+        # fail policy prevents the third signature run from being attempted.
+        assert client.query.call_count == 2
+        assert [c.args[0] for c in client.load_table_from_json.call_args_list] == [
+            [records[0]],
+            [records[1]],
+        ]
 
     def test_merge_temp_load_keeps_autodetect_when_target_column_is_absent(self) -> None:
         client = _fake_client()
@@ -380,7 +700,7 @@ class TestBigQueryDestinationLoad:
         assert {error.error_message for error in result.row_errors} == {"schema lookup failed"}
         client.load_table_from_json.assert_not_called()
         client.delete_table.assert_called_once_with(
-            "my-proj.analytics.user_scores_drt_tmp", not_found_ok=True
+            "my-proj.analytics.user_scores_drt_tmp_a1b2c3d4", not_found_ok=True
         )
 
     def test_merge_preserves_extended_identifiers(self) -> None:
@@ -397,7 +717,7 @@ class TestBigQueryDestinationLoad:
             BigQueryDestination().load(records, config, _options())
         assert client.load_table_from_json.call_args.args == (
             records,
-            "hyphenated-project.analytics.daily-events$20261004_drt_tmp",
+            "hyphenated-project.analytics.daily-events$20261004_drt_tmp_a1b2c3d4",
         )
         merge = next(sql for sql in _sqls(client) if sql.startswith("MERGE"))
         assert "MERGE `hyphenated-project.analytics.daily-events$20261004` T" in merge
@@ -466,7 +786,7 @@ class TestBigQueryDestinationLoad:
                 BigQueryDestination().load([{"id": 1}], config, _options(on_error="fail"))
         # temp table dropped even on failure (finally)
         client.delete_table.assert_called_once_with(
-            "my-proj.analytics.user_scores_drt_tmp", not_found_ok=True
+            "my-proj.analytics.user_scores_drt_tmp_a1b2c3d4", not_found_ok=True
         )
 
     def test_merge_error_on_error_skip_records_failure(self) -> None:
@@ -746,6 +1066,37 @@ class TestBigQueryReplaceMode:
 
 
 class TestBigQueryMirrorMode:
+    def test_sparse_batch_stages_all_mirror_keys_once_before_per_run_merges(self) -> None:
+        client = _fake_client()
+        modules = _mocked_bq_modules(client)
+        dest = BigQueryDestination()
+        config = _config(mode="merge", upsert_key=["id"])
+        options = _options(mode="mirror")
+        records = [
+            {"id": 1, "name": "omitted"},
+            {"id": 2, "name": "later", "note": "written"},
+            {"id": 3, "name": "explicit-null", "note": None},
+        ]
+
+        with patch.dict("sys.modules", modules):
+            result = dest.load(records, config, options)
+
+        assert result.success == 3
+        key_table = "my-proj.analytics.user_scores__drt_mirror_keys_a1b2c3d4"
+        key_loads = [
+            c for c in client.load_table_from_json.call_args_list if c.args[1] == key_table
+        ]
+        assert len(key_loads) == 1
+        assert key_loads[0].args[0] == [{"id": 1}, {"id": 2}, {"id": 3}]
+        tmp_table = "my-proj.analytics.user_scores_drt_tmp_a1b2c3d4"
+        tmp_loads = [
+            c for c in client.load_table_from_json.call_args_list if c.args[1] == tmp_table
+        ]
+        assert [c.args[0] for c in tmp_loads] == [[records[0]], records[1:]]
+        sqls = _sqls(client)
+        assert sqls[0].startswith("CREATE OR REPLACE TABLE")
+        assert len([sql for sql in sqls if sql.startswith("MERGE")]) == 2
+
     def test_stages_keys_across_batches_then_deletes_by_anti_join(self) -> None:
         client = _fake_client()
         modules = _mocked_bq_modules(client)
@@ -780,8 +1131,8 @@ class TestBigQueryMirrorMode:
         assert " IN (" not in delete
         client.delete_table.assert_has_calls(
             [
-                call("my-proj.analytics.user_scores_drt_tmp", not_found_ok=True),
-                call("my-proj.analytics.user_scores_drt_tmp", not_found_ok=True),
+                call("my-proj.analytics.user_scores_drt_tmp_a1b2c3d4", not_found_ok=True),
+                call("my-proj.analytics.user_scores_drt_tmp_a1b2c3d4", not_found_ok=True),
                 call(
                     "my-proj.analytics.user_scores__drt_mirror_keys_a1b2c3d4",
                     not_found_ok=True,
@@ -823,12 +1174,12 @@ class TestBigQueryMirrorMode:
         bq = modules["google.cloud.bigquery"]
         assert bq.LoadJobConfig.call_args_list == [
             call(
-                write_disposition=bq.WriteDisposition.WRITE_TRUNCATE,
+                write_disposition=bq.WriteDisposition.WRITE_APPEND,
                 schema=[id_field, parent_id_field],
                 autodetect=False,
             ),
             call(
-                write_disposition=bq.WriteDisposition.WRITE_APPEND,
+                write_disposition=bq.WriteDisposition.WRITE_TRUNCATE,
                 schema=[id_field, parent_id_field],
                 autodetect=False,
             ),
@@ -945,22 +1296,12 @@ class TestBigQueryMirrorMode:
             not_found_ok=True,
         )
 
-    @pytest.mark.parametrize(
-        ("mirror", "message"),
-        [
-            ({"strategy": "tracked"}, "not yet supported on bigquery"),
-            ({"strategy": "diff"}, "not yet supported on bigquery"),
-        ],
-    )
-    def test_unsupported_mirror_strategies_fail_before_client(
-        self, mirror: dict[str, str], message: str
-    ) -> None:
-        option_overrides = {"incremental_strategy": "diff"} if mirror["strategy"] == "diff" else {}
-        with pytest.raises(ValueError, match=message):
+    def test_tracked_mirror_strategy_fails_before_client(self) -> None:
+        with pytest.raises(ValueError, match="not yet supported on bigquery"):
             BigQueryDestination().load(
                 [{"id": 1}],
                 _config(upsert_key=["id"]),
-                _options(mode="mirror", mirror=mirror, **option_overrides),
+                _options(mode="mirror", mirror={"strategy": "tracked"}),
             )
 
     def test_mirror_requires_key_and_complete_scope(self) -> None:
@@ -996,7 +1337,136 @@ class TestBigQueryMirrorMode:
         assert dest.finalize_sync(_config(upsert_key=["id"]), _options(mode="mirror")) is None
         assert dest._mirror_aborted is False
 
-    def test_removal_only_diff_rejects_before_baseline_commit(self, tmp_path: Path) -> None:
+    def test_diff_stages_typed_composite_removed_keys_and_deletes_exact_matches(self) -> None:
+        client = _fake_client()
+        tenant_field = _schema_field("tenant_id")
+        id_field = _schema_field("id")
+        label_field = _schema_field("label")
+        client.get_table.return_value.schema = [tenant_field, id_field, label_field]
+        modules = _mocked_bq_modules(client)
+        destination = BigQueryDestination()
+        config = _config(upsert_key=["tenant_id", "id"])
+        options = _options(
+            mode="mirror",
+            incremental_strategy="diff",
+            mirror={"strategy": "diff"},
+        )
+        options._diff_removed_keys = [
+            {"tenant_id": 1, "id": 2},
+            {"tenant_id": 2, "id": 1},
+        ]
+        options._query_tags = {"sync": "mirror-diff"}
+
+        with patch.dict("sys.modules", modules):
+            result = destination.finalize_sync(config, options)
+
+        assert result is not None
+        scratch = "my-proj.analytics.user_scores__drt_mirror_keys_diff_a1b2c3d4"
+        sqls = _sqls(client)
+        assert sqls[0] == (
+            f"CREATE OR REPLACE TABLE `{scratch}` AS "
+            "SELECT `tenant_id`, `id` FROM `my-proj.analytics.user_scores` WHERE FALSE"
+        )
+        assert sqls[1] == (
+            "DELETE FROM `my-proj.analytics.user_scores` AS T "
+            f"WHERE EXISTS (SELECT 1 FROM `{scratch}` K "
+            "WHERE T.`tenant_id` = K.`tenant_id` AND T.`id` = K.`id`)"
+        )
+        assert " IN (" not in sqls[1]
+        client.load_table_from_json.assert_called_once()
+        assert client.load_table_from_json.call_args.args == (options._diff_removed_keys, scratch)
+        bq = modules["google.cloud.bigquery"]
+        assert client.load_table_from_json.call_args.kwargs["job_config"] == (
+            bq.LoadJobConfig.return_value
+        )
+        bq.LoadJobConfig.assert_called_once_with(
+            labels={"sync": "mirror-diff"},
+            write_disposition=bq.WriteDisposition.WRITE_APPEND,
+            schema=[tenant_field, id_field],
+            autodetect=False,
+        )
+        client.delete_table.assert_called_once_with(scratch, not_found_ok=True)
+        assert destination._mirror_keys_table_id is None
+
+    def test_diff_load_does_not_stage_added_or_changed_keys(self) -> None:
+        client = _fake_client()
+        modules = _mocked_bq_modules(client)
+        destination = BigQueryDestination()
+        options = _options(
+            mode="mirror",
+            incremental_strategy="diff",
+            mirror={"strategy": "diff"},
+        )
+        with patch.dict("sys.modules", modules):
+            result = destination.load(
+                [{"id": 1, "label": "changed"}],
+                _config(upsert_key=["id"]),
+                options,
+            )
+
+        assert result.success == 1
+        assert not any(sql.startswith("CREATE OR REPLACE TABLE") for sql in _sqls(client))
+        assert destination._mirror_keys_table_id is None
+        assert all(
+            call_.args[1] != "my-proj.analytics.user_scores__drt_mirror_keys_diff_a1b2c3d4"
+            for call_ in client.load_table_from_json.call_args_list
+        )
+
+    @pytest.mark.parametrize("removed_keys", [None, []])
+    def test_diff_with_no_removed_keys_is_a_noop(
+        self, removed_keys: list[dict[str, Any]] | None
+    ) -> None:
+        destination = BigQueryDestination()
+        options = _options(
+            mode="mirror",
+            incremental_strategy="diff",
+            mirror={"strategy": "diff"},
+        )
+        options._diff_removed_keys = removed_keys
+        with patch.object(destination, "_build_client") as build_client:
+            assert destination.finalize_sync(_config(upsert_key=["id"]), options) is None
+        build_client.assert_not_called()
+
+    def test_diff_removed_key_validation_runs_before_client_creation(self) -> None:
+        destination = BigQueryDestination()
+        options = _options(
+            mode="mirror",
+            incremental_strategy="diff",
+            mirror={"strategy": "diff"},
+        )
+        with patch.object(destination, "_build_client") as build_client:
+            options._diff_removed_keys = [{"tenant_id": 1}]
+            with pytest.raises(ValueError, match="upsert_key columns missing"):
+                destination.finalize_sync(_config(upsert_key=["tenant_id", "id"]), options)
+            options._diff_removed_keys = [{"tenant_id": 1, "id": None}]
+            with pytest.raises(ValueError, match="does not support NULL"):
+                destination.finalize_sync(_config(upsert_key=["tenant_id", "id"]), options)
+        build_client.assert_not_called()
+
+    def test_diff_delete_failure_still_drops_staged_keys(self) -> None:
+        client = _fake_client()
+        delete_job = MagicMock()
+        delete_job.result.side_effect = RuntimeError("delete boom")
+        client.query.side_effect = [MagicMock(), delete_job]
+        modules = _mocked_bq_modules(client)
+        destination = BigQueryDestination()
+        options = _options(
+            mode="mirror",
+            incremental_strategy="diff",
+            mirror={"strategy": "diff"},
+        )
+        options._diff_removed_keys = [{"id": 7}]
+
+        with patch.dict("sys.modules", modules):
+            with pytest.raises(RuntimeError, match="delete boom"):
+                destination.finalize_sync(_config(upsert_key=["id"]), options)
+
+        client.delete_table.assert_called_once_with(
+            "my-proj.analytics.user_scores__drt_mirror_keys_diff_a1b2c3d4",
+            not_found_ok=True,
+        )
+
+    def test_removal_only_diff_deletes_before_baseline_commit(self, tmp_path: Path) -> None:
         class RemovalOnlySource:
             def __init__(self) -> None:
                 self.extract_calls = 0
@@ -1034,6 +1504,8 @@ class TestBigQueryMirrorMode:
 
         source = RemovalOnlySource()
         destination = BigQueryDestination()
+        client = _fake_client()
+        modules = _mocked_bq_modules(client)
         sync = SyncConfig(
             name="bigquery_removal_only",
             model="ref('users')",
@@ -1046,12 +1518,88 @@ class TestBigQueryMirrorMode:
         )
         profile = BigQueryProfile(type="bigquery", project="p", dataset="d")
 
-        with patch.object(destination, "load", wraps=destination.load) as load:
-            with pytest.raises(ValueError, match="not yet supported on bigquery"):
-                run_sync(sync, source, destination, profile, tmp_path)
+        with (
+            patch.dict("sys.modules", modules),
+            patch.object(destination, "load", wraps=destination.load) as load,
+        ):
+            result = run_sync(sync, source, destination, profile, tmp_path)
 
+        assert result.success == 0
+        assert result.failed == 0
+        assert result.diff_removed_keys == [{"id": 7}]
+        delete = next(sql for sql in _sqls(client) if sql.startswith("DELETE FROM"))
+        assert "T.`id` = K.`id`" in delete
         load.assert_not_called()
         assert source.extract_calls == 1
+        assert source.commit_calls == 1
+
+    def test_interrupted_diff_does_not_delete_or_commit_baseline(self, tmp_path: Path) -> None:
+        class InterruptedDiffSource:
+            def __init__(self) -> None:
+                self.commit_calls = 0
+
+            def extract(
+                self,
+                query: str,
+                config: ProfileConfig,
+                *,
+                query_tags: dict[str, str] | None = None,
+            ) -> Iterator[dict[str, Any]]:
+                raise AssertionError("ordinary extraction must not run")
+
+            def extract_snapshot_diff(
+                self,
+                query: str,
+                config: ProfileConfig,
+                *,
+                sync_name: str,
+                key_columns: list[str],
+                hash_columns: Any,
+                query_tags: dict[str, str] | None = None,
+            ) -> SnapshotDiffResult:
+                return SnapshotDiffResult(
+                    added=iter(()),
+                    changed=iter(()),
+                    removed_keys=iter(({"id": 7},)),
+                    is_first_run=False,
+                )
+
+            def commit_snapshot_diff(self, config: ProfileConfig, sync_name: str) -> None:
+                self.commit_calls += 1
+
+        source = InterruptedDiffSource()
+        destination = BigQueryDestination()
+        client = _fake_client()
+        modules = _mocked_bq_modules(client)
+        stop_event = threading.Event()
+        stop_event.set()
+
+        sync = SyncConfig(
+            name="interrupted_bigquery_diff_mirror",
+            model="ref('users')",
+            destination=_config(upsert_key=["id"]),
+            sync=_options(
+                mode="mirror",
+                incremental_strategy="diff",
+                mirror={"strategy": "diff"},
+                batch_size=1,
+            ),
+        )
+        profile = BigQueryProfile(type="bigquery", project="p", dataset="d")
+
+        with patch.dict("sys.modules", modules):
+            result = run_sync(
+                sync,
+                source,
+                destination,
+                profile,
+                tmp_path,
+                stop_event=stop_event,
+            )
+
+        assert result.interrupted is True
+        assert sync.sync._interrupted is False  # cleared by reset_write_state()
+        assert not any(sql.startswith("DELETE FROM") for sql in _sqls(client))
         assert source.commit_calls == 0
 
     def test_failed_key_stage_aborts_delete(self) -> None:
@@ -1074,7 +1622,6 @@ class TestBigQueryMirrorMode:
         failed_stage = MagicMock()
         failed_stage.result.side_effect = RuntimeError("stage boom")
         client.load_table_from_json.side_effect = [
-            MagicMock(),
             MagicMock(),
             MagicMock(),
             failed_stage,
@@ -1110,12 +1657,36 @@ class TestBigQueryMirrorMode:
         assert final is not None
         assert client.query.call_args_list[-1].args[0].startswith("DELETE FROM")
 
+    def test_fail_policy_merge_error_cleans_complete_key_stage_before_raising(self) -> None:
+        client = _fake_client()
+        failed_merge = MagicMock()
+        failed_merge.result.side_effect = RuntimeError("merge boom")
+        client.query.side_effect = [MagicMock(), failed_merge]
+        modules = _mocked_bq_modules(client)
+        dest = BigQueryDestination()
+        config = _config(upsert_key=["id"])
+        options = _options(mode="mirror", on_error="fail")
+
+        with patch.dict("sys.modules", modules):
+            with pytest.raises(RuntimeError, match="merge boom"):
+                dest.load([{"id": 1}], config, options)
+
+        client.delete_table.assert_has_calls(
+            [
+                call(
+                    "my-proj.analytics.user_scores__drt_mirror_keys_a1b2c3d4",
+                    not_found_ok=True,
+                ),
+                call("my-proj.analytics.user_scores_drt_tmp_a1b2c3d4", not_found_ok=True),
+            ]
+        )
+        assert dest._mirror_keys_table_id is None
+
     def test_fail_policy_cleans_existing_key_stage_before_raising(self) -> None:
         client = _fake_client()
         failed_stage = MagicMock()
         failed_stage.result.side_effect = RuntimeError("stage boom")
         client.load_table_from_json.side_effect = [
-            MagicMock(),
             MagicMock(),
             MagicMock(),
             failed_stage,
@@ -1134,6 +1705,9 @@ class TestBigQueryMirrorMode:
 
 
 class TestBigQueryHelpers:
+    def test_contiguous_signature_runs_empty(self) -> None:
+        assert BigQueryDestination._contiguous_signature_runs([]) == []
+
     def test_supported_modes_and_optional_job_configs(self) -> None:
         dest = BigQueryDestination()
         assert dest.supported_modes() == frozenset({"replace", "mirror"})
