@@ -137,6 +137,8 @@ class SQSDestinationConfig(DescribableConfig):
     # FIFO-only fields; validation requires the resolved queue URL.
     message_group_id_field: str | None = None
     deduplication_id_field: str | None = None
+    retry: RetryConfig | None = None
+    rate_limit: RateLimitConfig | None = None
 
     def _describe_detail(self) -> str:
         return self.queue_url_env
