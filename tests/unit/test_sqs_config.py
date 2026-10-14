@@ -24,7 +24,26 @@ def test_sqs_config_parses_in_sync() -> None:
     assert config.region is None
     assert config.message_group_id_field is None
     assert config.deduplication_id_field is None
+    assert config.retry is None
+    assert config.rate_limit is None
     assert config.describe_safe() == "sqs"
+
+
+def test_sqs_config_preserves_destination_overrides() -> None:
+    destination = {
+        "type": "sqs",
+        "queue_url_env": "SQS_QUEUE_URL",
+        "retry": {"max_attempts": 2, "initial_backoff": 0},
+        "rate_limit": {"requests_per_second": 25, "burst": 3},
+    }
+    sync = models.SyncConfig(name="work_items", model="work_items", destination=destination)
+    config = sync.destination
+    assert isinstance(config, models.SQSDestinationConfig)
+    assert config.retry == models.RetryConfig(max_attempts=2, initial_backoff=0)
+    assert config.rate_limit == models.RateLimitConfig(requests_per_second=25, burst=3)
+    serialized = config.model_dump()
+    assert serialized["retry"]["max_attempts"] == 2
+    assert serialized["rate_limit"]["requests_per_second"] == 25
 
 
 def test_sqs_config_accepts_fifo_field_names() -> None:

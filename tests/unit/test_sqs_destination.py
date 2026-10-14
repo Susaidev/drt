@@ -23,6 +23,7 @@ from drt.config.models import (
     SyncOptions,
 )
 from drt.destinations.base import SyncResult
+from drt.destinations.rate_limiter import RateLimiter
 from drt.destinations.sqs import SQSDestination
 from drt.engine.observer import DlqObserver
 from drt.engine.sync import run_sync
@@ -75,6 +76,142 @@ def client(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     sqs.send_message_batch.side_effect = lambda **kw: _success(*(e["Id"] for e in kw["Entries"]))
     monkeypatch.setitem(sys.modules, "boto3", boto3)
     return sqs
+
+
+@pytest.fixture
+def limiters(monkeypatch: pytest.MonkeyPatch) -> list[RateLimiter]:
+    created: list[RateLimiter] = []
+
+    def factory(*, key: str, requests_per_second: float, burst: int | None) -> RateLimiter:
+        limiter = RateLimiter(key=key, requests_per_second=requests_per_second, burst=burst)
+        created.append(limiter)
+        return limiter
+
+    monkeypatch.setattr("drt.destinations.rate_limiter.get_rate_limiter_backend", lambda: factory)
+    return created
+
+
+@pytest.mark.parametrize("destination_attempts,expected_attempts", [(None, 4), (2, 2)])
+def test_destination_retry_overrides_sync(
+    client: MagicMock, destination_attempts: int | None, expected_attempts: int
+) -> None:
+    retry = (
+        {"max_attempts": destination_attempts, "initial_backoff": 0}
+        if destination_attempts is not None
+        else None
+    )
+    options = _options().model_copy(
+        update={"retry": RetryConfig(max_attempts=4, initial_backoff=0)}
+    )
+    client.send_message_batch.side_effect = None
+    client.send_message_batch.return_value = {
+        "Successful": [],
+        "Failed": [_failure("0", sender_fault=False)],
+    }
+    result = SQSDestination().load([{"id": 1}], _config(retry=retry), options)
+    assert client.send_message_batch.call_count == expected_attempts
+    assert result.success == 0
+    assert result.failed == 1
+    assert result.row_errors[0].batch_index == 0
+
+
+@pytest.mark.parametrize(
+    "destination_rate,expected_rate,expected_burst", [(None, 10, None), (25, 25, 3)]
+)
+def test_destination_rate_limit_overrides_sync(
+    client: MagicMock,
+    limiters: list[RateLimiter],
+    destination_rate: int | None,
+    expected_rate: int,
+    expected_burst: int | None,
+) -> None:
+    rate_limit = (
+        {"requests_per_second": destination_rate, "burst": 3}
+        if destination_rate is not None
+        else None
+    )
+    options = _options().model_copy(update={"rate_limit": RateLimitConfig(requests_per_second=10)})
+    result = SQSDestination().load([{"id": 1}], _config(rate_limit=rate_limit), options)
+    assert result.success == 1
+    assert len(limiters) == 1
+    assert limiters[0].requests_per_second == expected_rate
+    assert limiters[0].burst == expected_burst
+
+
+@pytest.mark.parametrize(
+    "other_url",
+    [
+        "https://sqs.us-east-1.amazonaws.com/123456789012/other-queue",
+        "https://sqs.us-east-1.amazonaws.com/999999999999/work-items",
+        "https://sqs.eu-west-1.amazonaws.com/123456789012/work-items",
+    ],
+)
+def test_independent_queues_have_independent_rate_limiters(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch, limiters: list[RateLimiter], other_url: str
+) -> None:
+    destination = SQSDestination()
+    destination.load([{"id": 1}], _config(), _options())
+    monkeypatch.setenv("SQS_QUEUE_URL", other_url)
+    destination.load([{"id": 2}], _config(), _options())
+    assert len(limiters) == 2
+    assert limiters[0] is not limiters[1]
+    assert limiters[0].key != limiters[1].key
+
+
+def test_queue_env_aliases_share_the_resolved_queue_limiter(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch, limiters: list[RateLimiter]
+) -> None:
+    monkeypatch.setenv("SQS_QUEUE_ALIAS", QUEUE_URL)
+    SQSDestination().load([{"id": 1}], _config(), _options())
+    SQSDestination().load([{"id": 2}], _config(queue_url_env="SQS_QUEUE_ALIAS"), _options())
+    assert len(limiters) == 1
+
+
+@pytest.mark.parametrize(
+    "field,parameter",
+    [
+        ("message_group_id_field", "MessageGroupId"),
+        ("deduplication_id_field", "MessageDeduplicationId"),
+    ],
+)
+@pytest.mark.parametrize(
+    "value", ["line\nbreak", "tab\t", "emoji😀", "café", "with space", "\x00", "\x7f"]
+)
+def test_fifo_ids_reject_forbidden_characters_locally(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch, field: str, parameter: str, value: str
+) -> None:
+    monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + ".fifo")
+    config = _config(
+        message_group_id_field="group",
+        **({field: "event_id"} if field != "message_group_id_field" else {}),
+    )
+    record = {"group": value if field == "message_group_id_field" else "valid", "event_id": value}
+    result = SQSDestination().load([record], config, _options())
+    assert result.success == 0
+    assert result.failed == 1
+    assert result.row_errors[0].batch_index == 0
+    message = result.row_errors[0].error_message
+    assert parameter in message
+    assert ("group" if field == "message_group_id_field" else "event_id") in message
+    assert "ASCII" in message
+    client.send_message_batch.assert_not_called()
+
+
+def test_fifo_ids_accept_ascii_alphanumerics_and_all_allowed_punctuation(
+    client: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SQS_QUEUE_URL", QUEUE_URL + ".fifo")
+    value = "aAzZ09!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+    result = SQSDestination().load(
+        [{"group": value, "event_id": value}],
+        _config(message_group_id_field="group", deduplication_id_field="event_id"),
+        _options(),
+    )
+    assert result.success == 1
+    assert result.failed == 0
+    entry = client.send_message_batch.call_args.kwargs["Entries"][0]
+    assert entry["MessageGroupId"] == value
+    assert entry["MessageDeduplicationId"] == value
 
 
 def test_empty_batch_needs_neither_boto3_nor_queue_url(monkeypatch: pytest.MonkeyPatch) -> None:
