@@ -51,6 +51,8 @@ become `MessageGroupId` and `MessageDeduplicationId` respectively.
 | `region` | string \| null | null | AWS region; uses boto3's configured default when omitted |
 | `message_group_id_field` | string \| null | null | Source field supplying the group ID; required for FIFO, rejected for standard queues |
 | `deduplication_id_field` | string \| null | null | Source field supplying the deduplication ID; optional for FIFO, rejected for standard queues |
+| `retry` | object \| null | null | Partial-entry retry settings; overrides `sync.retry` as a whole when set |
+| `rate_limit` | object \| null | null | Request pacing settings; overrides `sync.rate_limit` as a whole when set |
 
 FIFO detection uses the **resolved queue URL's `.fifo` suffix**, rather than
 the presence of a group field. Validation happens at runtime after URL
@@ -61,7 +63,9 @@ importing boto3.
 
 Configured ID fields accept strings, numbers (including native Decimal
 values), and UUIDs. They are rendered as non-empty strings of at most 128
-characters. Missing or invalid values are row errors. If
+characters containing only ASCII letters, digits, and punctuation; whitespace,
+control characters, and non-ASCII characters are rejected locally as row errors.
+Missing or invalid values are row errors. If
 `deduplication_id_field` is omitted for FIFO, the queue
 must have **content-based deduplication enabled**; drt leaves the
 deduplication ID unset so SQS can derive it from the message body.
@@ -127,7 +131,7 @@ drt checks each entry separately:
 
 - Successful entries are counted once and are never included in a partial-failure retry.
 - `SenderFault=true` becomes a row error immediately, without retry.
-- `SenderFault=false` retries only the failed entries using `sync.retry`'s bounded attempts and exponential backoff.
+- `SenderFault=false` retries only the failed entries using `destination.retry` (or `sync.retry` when omitted) for bounded attempts and exponential backoff.
 - Entries still failing after the final attempt become row errors with their original record indices.
 
 Use `sync.on_error: skip` to continue after row errors. With `fail`, drt
@@ -140,7 +144,28 @@ Request-level exceptions propagate when
 the SDK cannot complete the request; boto3 retains its normal SDK retry
 behavior. A response that does not account for every requested entry
 aborts the sync rather than crediting unconfirmed messages as successes.
-`sync.rate_limit` paces requests, including partial retries.
+`destination.rate_limit` (or `sync.rate_limit` when omitted) paces requests,
+including partial retries. Both retry and rate-limit precedence are
+destination > sync > default; an override replaces the entire settings object.
+For example:
+
+```yaml
+destination:
+  type: sqs
+  queue_url_env: SQS_QUEUE_URL
+  retry:
+    max_attempts: 4
+    initial_backoff: 1.0
+  rate_limit:
+    requests_per_second: 20
+    burst: 5
+```
+
+Workers sending to the same resolved queue URL share a rate limiter, even
+when they use different environment variable names. Different queue URLs
+have independent limiters; the URL includes the queue's account and regional
+endpoint. When workers specify different limits for the same queue, the
+shared limiter adopts the stricter settings.
 
 ## References
 
