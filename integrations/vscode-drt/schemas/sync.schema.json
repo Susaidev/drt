@@ -4070,6 +4070,28 @@
           ],
           "default": null,
           "title": "Deduplication Id Field"
+        },
+        "retry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RetryConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "rate_limit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RateLimitConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
