@@ -25,7 +25,7 @@ from drt.destinations.row_errors import record_preview, record_row_error
 
 _MAX_ENTRIES = 10
 _MAX_PAYLOAD_BYTES = 1_048_576
-
+_ID_CHARACTERS = ascii_letters + digits + punctuation
 
 class _TransientBatchError(Exception):
     """Signal that the pending entries need another bounded attempt."""
@@ -193,6 +193,12 @@ class SQSDestination:
                 if not text or len(text) > 128:
                     raise ValueError(
                         f"SQS {parameter}: record field {field!r} must contain 1–128 characters."
+                    )
+                if any(character not in _ID_CHARACTERS for character in text):
+                    raise ValueError(
+                        f"SQS {parameter}: record field {field!r} must contain only "
+                        "ASCII letters, digits, and punctuation "
+                        "(no whitespace or control characters)."
                     )
                 entry[parameter] = text
         return entry
