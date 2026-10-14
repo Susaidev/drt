@@ -12,14 +12,15 @@ from __future__ import annotations
 
 from decimal import Decimal
 from json import dumps
+from string import ascii_letters, digits, punctuation
 from typing import Any
 from uuid import UUID
 
 from drt.config.credentials import resolve_env
-from drt.config.models import DestinationConfig, SQSDestinationConfig, SyncOptions
+from drt.config.models import DestinationConfig, RetryConfig, SQSDestinationConfig, SyncOptions
 from drt.destinations.base import SyncResult
 from drt.destinations.rate_limiter import RateLimiterBackend, resolve_rate_limiter
-from drt.destinations.retry import with_retry
+from drt.destinations.retry import resolve_retry, with_retry
 from drt.destinations.row_errors import record_preview, record_row_error
 
 _MAX_ENTRIES = 10
@@ -84,7 +85,8 @@ class SQSDestination:
                     )
 
         client = self._client(config)
-        limiter = resolve_rate_limiter(config, sync_options)
+        limiter = resolve_rate_limiter(config, sync_options, key_override=f"sqs:{queue_url}")
+        retry_config = resolve_retry(config.retry, sync_options)
         result = SyncResult()
         entries: list[dict[str, str]] = []
         payload_bytes = 0
@@ -122,7 +124,7 @@ class SQSDestination:
                     and any(item["MessageGroupId"] == group_key[1] for item in entries)
                 )
             ):
-                self._send_batch(client, queue_url, entries, records, result, sync_options, limiter)
+                self._send_batch(client, queue_url, entries, records, result, retry_config, limiter)
                 if result.failed and sync_options.on_error == "fail":
                     # Unsent rows must not be inferred as delivered by the engine.
                     result.skipped = len(records) - result.total
@@ -146,7 +148,7 @@ class SQSDestination:
             payload_bytes += size
 
         if entries:
-            self._send_batch(client, queue_url, entries, records, result, sync_options, limiter)
+            self._send_batch(client, queue_url, entries, records, result, retry_config, limiter)
         if is_fifo:
             # Validation can fail before an earlier buffered send completes.
             # Preserve source order when the engine stores these rows in the DLQ.
@@ -202,7 +204,7 @@ class SQSDestination:
         entries: list[dict[str, str]],
         records: list[dict[str, Any]],
         result: SyncResult,
-        sync_options: SyncOptions,
+        retry_config: RetryConfig,
         limiter: RateLimiterBackend,
     ) -> None:
         """
@@ -255,7 +257,7 @@ class SQSDestination:
         try:
             with_retry(
                 send_pending,
-                sync_options.retry,
+                retry_config,
                 retry_on=lambda exc: isinstance(exc, _TransientBatchError),
             )
         except _TransientBatchError:
