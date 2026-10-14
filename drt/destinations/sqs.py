@@ -27,6 +27,7 @@ _MAX_ENTRIES = 10
 _MAX_PAYLOAD_BYTES = 1_048_576
 _ID_CHARACTERS = ascii_letters + digits + punctuation
 
+
 class _TransientBatchError(Exception):
     """Signal that the pending entries need another bounded attempt."""
 
