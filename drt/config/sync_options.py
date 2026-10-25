@@ -43,6 +43,7 @@ from drt.config.destinations_saas import (
     HubSpotDestinationConfig,
     IntercomDestinationConfig,
     JiraDestinationConfig,
+    KafkaDestinationConfig,
     KlaviyoDestinationConfig,
     LinearDestinationConfig,
     MetaConversionsDestinationConfig,
@@ -887,6 +888,7 @@ DestinationConfig = Annotated[
     Annotated[RestApiDestinationConfig, Tag("rest_api")]
     | Annotated[SlackDestinationConfig, Tag("slack")]
     | Annotated[SQSDestinationConfig, Tag("sqs")]
+    | Annotated[KafkaDestinationConfig, Tag("kafka")]
     | Annotated[DiscordDestinationConfig, Tag("discord")]
     | Annotated[GitHubActionsDestinationConfig, Tag("github_actions")]
     | Annotated[HubSpotDestinationConfig, Tag("hubspot")]
