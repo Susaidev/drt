@@ -342,6 +342,8 @@ def run_sync(
     reviewed_forced_guards: set[str] | None = None,
     reviewed_guard_deletes: int | None = None,
     reviewed_guard_baseline: int | None = None,
+    plan_id: str | None = None,
+    approved_by: str | None = None,
 ) -> SyncResult:
     """Run a single sync: extract from source, load to destination.
 
@@ -543,13 +545,10 @@ def run_sync(
 
                 guards_outcome: dict[str, Any] | None = total_result.guards
                 if raised is not None:
-                    from drt.engine.guards import GuardTripped
+                    from drt.engine.guards import GuardTripped, guards_outcome_of
 
                     if isinstance(raised, GuardTripped):
-                        guards_outcome = {
-                            "tripped": [trip.to_dict() for trip in raised.trips],
-                            "forced": False,
-                        }
+                        guards_outcome = guards_outcome_of(raised)
 
                 history_manager.append(
                     HistoryEntry(
@@ -565,6 +564,8 @@ def run_sync(
                         run_id=run_id,
                         sync_run_id=sync_run_id,
                         guards=guards_outcome,
+                        plan_id=plan_id,
+                        approved_by=approved_by,
                     )
                 )
                 history_manager.prune(sync.name, history_retention_days)

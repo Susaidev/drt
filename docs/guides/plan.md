@@ -82,6 +82,9 @@ reason when:
   extraction writes scratch tables, so it is not read-only), or an engine
   metadata column inside `upsert_key`.
 
+See [plan coverage by destination](plan-coverage.md) for which destinations can be
+planned today.
+
 ## Review loop in CI (GitHub Actions)
 
 ```bash
@@ -274,12 +277,16 @@ overrode, and records each override once in `run_results.json` and the plan's
 claim file. If a run-time value grows beyond the reviewed forced value, apply
 refuses with the new trip and requires a new plan.
 
-PostgreSQL, MySQL and Snowflake also enforce the delete-side limits in the finalization
-transaction. For mirror strategies, drt reads the percentage baseline, runs the
-`DELETE`, judges the driver's actual affected-row count, and rolls back when the
-guard trips; tracked-state rewrites happen only after the guard passes and commit
-with the delete. A refusal is an ordinary failed sync: no deletion is committed,
-failure alerts and history record it, the watermark does not advance, and `drt
+PostgreSQL, MySQL, Snowflake, Databricks, BigQuery and ClickHouse also enforce the delete-side limits at run time, in
+two different ways. **PostgreSQL, MySQL and Snowflake** run the `DELETE` inside the
+finalization transaction, judge the driver's actual affected-row count, and roll
+back when a guard trips (if the rollback itself fails, the error says the outcome
+is uncertain). **Databricks, BigQuery and ClickHouse** have no multi-statement
+rollback: drt counts the exact rows the statement would remove first and refuses
+*before* deleting; Databricks and BigQuery also re-check the statement's own
+count afterwards and report an "already committed" failure if it was larger or
+unreadable. Tracked-state rewrites happen only after the guard passes. A refusal
+before the delete is an ordinary failed sync: nothing is deleted, failure alerts and history record it, the watermark does not advance, and `drt
 run` exits 1. A reviewed
 override must be explicit (`drt run --force-guards`, or `--force-guards` on
 `drt apply`; the MCP tools have the matching `force_guards` parameter). MCP
@@ -297,7 +304,7 @@ override must be explicit (`drt run --force-guards`, or `--force-guards` on
 - Percentage comparisons use exact decimal arithmetic. The displayed percentage
   is rounded to two decimals, but the decision is not: 290/100000 is exactly
   0.29% and passes a 0.29% limit, while 291/100000 trips it.
-- **Run-time enforcement covers PostgreSQL, MySQL and Snowflake so far** (other warehouses follow). For
+- **Run-time enforcement covers PostgreSQL, MySQL, Snowflake and Databricks so far** (and now BigQuery and ClickHouse; see below). Databricks and BigQuery cannot roll a DELETE back: it counts the exact rows first and refuses before deleting, and if the statement's own result later shows more rows than the limit allows (a concurrent writer) it reports that the deletion is already committed instead of claiming nothing happened. For
   `mirror.strategy: destination`, the same scoped predicate used for the
   baseline (including `mirror.scope`) is deleted inside the transaction and the
   actual row count is authoritative. Tracked and diff mirror do the same;
@@ -321,14 +328,14 @@ override must be explicit (`drt run --force-guards`, or `--force-guards` on
   classifications. Configuring only those two adds no run-time queries or
   behavior changes.
 - **Apply still judges all four guards on its verification extraction.** The
-  write extracts again; PostgreSQL/MySQL/Snowflake then re-check delete-side limits at
+  write extracts again; PostgreSQL/MySQL/Snowflake/Databricks/BigQuery/ClickHouse then re-check delete-side limits at
   finalization. Create/update changes in that short window remain protected by
   review-time verification only.
-- Forced-guard details are persisted in local and GCS/S3 object-store history
-  and in `target/drt/run_results.json`. Warehouse-backed `_drt_history` keeps
-  its existing schema for compatibility with already-managed tables and does
-  not store the new `guards` field yet. A follow-up schema-evolution issue is
-  needed before that backend can retain it.
+- Forced-guard details are persisted in local and GCS/S3 object-store history,
+  in `target/drt/run_results.json`, and in warehouse-backed `_drt_history` (an
+  optional `guards` column that drt adds on the first append when the role may
+  alter the table; otherwise it logs a warning and records the legacy columns only,
+  see [warehouse state](warehouse-state.md#optional-history-columns-guards)).
 
 ## Exit codes
 
@@ -410,3 +417,26 @@ there, but two machines with separate workspaces do not see each other's claims;
 coordinating those needs a shared claim store, which is not built yet. The apply
 run gets a normal `run_id`; the claim file and `run_results.json` link it to the
 `plan_id`.
+
+### Lineage: which plan produced which run
+
+The claim file and `run_results.json` are workspace-local. The run history is the
+record that outlives an ephemeral CI runner, so `drt apply` also writes the
+`plan_id` and the `approved_by` name onto the run's history entry (an ordinary
+`drt run` leaves both empty). That makes the question "which reviewed plan did
+this run apply, and who approved it?" answerable from history alone:
+
+- `drt status --history` adds a **Plan** column (the plan id and approver) when
+  any listed run applied a plan; `--output json` and the MCP `drt_get_history`
+  tool return `plan_id`, `approved_by` and `guards` on each entry.
+- Warehouse-backed history stores them in optional `plan_id` / `approved_by`
+  columns, added on the first append like `guards` (see
+  [Warehouse-backed state](warehouse-state.md#optional-history-columns)).
+- The docs manifest (schema v4) carries `plan_id` and `guards` on each
+  `runs[]` entry. `approved_by` is a person's name, so it appears only with
+  `drt docs generate --full-labels`. See
+  [ADR 0013](../adr/0013-plan-apply-lineage.md).
+
+`approved_by` is recorded as supplied; it is an audit note, not proof of identity.
+
+A failure before the run starts (permission check, destination setup) writes no history entry, exactly like an ordinary `drt run`; the claim file (state `failed`) and `run_results.json` still carry the plan id.

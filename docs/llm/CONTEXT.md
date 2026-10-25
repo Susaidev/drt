@@ -14,7 +14,7 @@ dlt (load into DWH) → dbt (transform) → drt (activate out of DWH)
 - **Tagline:** "Reverse ETL as code — no UI, no lock-in, no per-row bill."
 - **Install:** `pip install drt-core` or `uv add drt-core`
 - **Package name:** `drt-core` (PyPI) — CLI command is `drt`
-- **Current version:** v1.1.0
+- **Current version:** v1.2.1
 
 ## What drt is NOT
 
@@ -80,6 +80,9 @@ my-project/
 | MySQL | `drt-core[mysql]` | Uses pymysql. Supports host, port, dbname, user, password_env |
 | Databricks | `drt-core[databricks]` | SQL Warehouse via databricks-sql-connector. Supports Unity Catalog, access_token_env, managed_schema |
 | SQL Server | `drt-core[sqlserver]` | Microsoft SQL Server via pure-Python pymssql. Supports host, port, database, user, password_env |
+| Delta Lake | `drt-core[deltalake]` | Delta tables from a local path, S3, or GCS (no warehouse in between) |
+| Apache Iceberg | `drt-core[iceberg]` | Iceberg tables through a REST, SQL, Hive, or local catalog |
+| REST API | (core) | Read records from an HTTP API |
 
 Source is configured in `~/.drt/profiles.yml` (dbt-style):
 
@@ -123,6 +126,14 @@ default:
 | Databricks | `databricks` | INSERT / MERGE, replace, and mirror into Delta tables. Requires `drt-core[databricks]` |
 | BigQuery | `bigquery` | INSERT / MERGE, load-job replace, and mirror. Requires `drt-core[bigquery]` |
 | Amplitude | `amplitude` | Identify API (user properties) or HTTP V2 API (events). No extra dependencies. |
+| Airtable | `airtable` | Append or upsert records into an Airtable base table. No extra dependencies |
+| Klaviyo | `klaviyo` | Upsert profiles or track events. No extra dependencies |
+| Mixpanel | `mixpanel` | Profile-set (`/engage`) or events (`/import`). No extra dependencies |
+| Elasticsearch / OpenSearch | `elasticsearch` | Bulk-index rows via the `_bulk` API. No extra dependencies |
+| Amazon S3 | `s3` | CSV / JSON / JSONL / Parquet objects, optional gzip. Requires `drt-core[s3]` |
+| Google Cloud Storage | `gcs` | CSV / JSON / JSONL / Parquet objects, optional gzip. Requires `drt-core[gcs]` |
+| Azure Blob Storage | `azure_blob` | CSV / JSON / JSONL / Parquet blobs, optional gzip. Requires `drt-core[azure]` |
+| Amazon SQS | `sqs` | JSON messages to a standard or FIFO queue, boto3 credential chain. Requires `drt-core[sqs]` |
 
 ## CLI Commands
 
@@ -169,7 +180,7 @@ drt mcp run                       # start MCP server (requires drt-core[mcp])
 drt serve --port 8080             # HTTP webhook endpoint — POST /sync/<name> answers 202 + run id (poll GET /runs/<id>, or ?wait=true for the result); same-sync triggers coalesce, different syncs run concurrently, nothing accepted is dropped (#854). Auth: --auth none|bearer|hmac|oidc, applied to every route except GET /health (GET /runs/<id> included; under hmac a POST signs its raw body while a GET signs the request path under a derived key, so a signature is bound to one run id and cannot be replayed as a POST, #936)
 drt serve --auth oidc --oidc-audience <aud> --oidc-email <email>  # OIDC JWT verification for Pub/Sub push (#903) — needs drt-core[serve-oidc]; verifies signature against Google's rotating public keys, requires email_verified:true for --oidc-email, fails closed (401) if the extra isn't installed. Google-specific: no --oidc-issuer override, since verify_oauth2_token only ever fetches Google's own certs
 drt docs generate                 # static docs site to target/docs/ (html; also --format mermaid|json|dbt-exposures). dbt-exposures prints deterministic ref()-only dbt exposure YAML to stdout (#781). Destination labels are docs-safe by default (#696): object identity (table/channel/sheet/bucket) stays, endpoints/hosts/phones/emails do not
-drt docs generate --full-labels   # verbatim describe() labels + unredacted error text — trusted/internal hosting only (#696/#698)
+drt docs generate --full-labels   # verbatim describe() labels + unredacted error text + runs[].approved_by — trusted/internal hosting only (#696/#698/#1222)
 drt docs generate --history-depth 20  # recent runs per sync embedded in the manifest from .drt/history (schema v2, #698; default 10, 0 disables, --no-state omits)
 drt docs generate --inline        # html only: emit the whole catalog as ONE self-contained navigable HTML object — inlined CSS/JS + in-page (#hash) navigation (Elementary single-file model), zero sub-resource AND zero inter-object requests — so it renders and navigates on an authenticated object store (GCS storage.cloud.google.com / S3 presigned URLs) where per-object auth breaks the multi-file output's assets and cross-links (#818/#821). Display byte-identical to the default; default output stays multi-file
 drt deploy github-actions --schedule "40 3 * * *"  # scaffold .github/workflows/drt-sync.yml — drt-action wired, extras inferred, required secrets enumerated (#785)

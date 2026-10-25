@@ -52,7 +52,7 @@ import hashlib
 import json
 import re
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 
 from drt.config.credentials import resolve_env
 from drt.config.models import DatabricksDestinationConfig, DestinationConfig, SyncOptions
@@ -60,6 +60,7 @@ from drt.destinations.base import SyncResult
 from drt.destinations.row_errors import record_row_error
 from drt.destinations.sql_base import BaseSqlDestination, _union_columns
 from drt.destinations.sql_utils import check_mirror_supported, tagged_cursor
+from drt.engine.guards import GuardTripped, run_cleanup_preserving_guard, verify_committed_delete
 
 _SWAP_SUFFIX = "__drt_swap"
 _ALLOW_COLUMN_DEFAULTS = "TBLPROPERTIES ('delta.feature.allowColumnDefaults' = 'supported')"
@@ -795,6 +796,9 @@ class DatabricksDestination(BaseSqlDestination):
         scope_cols: list[str] | None,
         scopes: list[tuple[Any, ...]] | None,
         negate: bool,
+        *,
+        guard_options: SyncOptions | None = None,
+        guard_baseline: int | None | Literal["table"] = None,
     ) -> None:
         """Stage ``keys`` into a scratch Delta table, then DELETE from
         ``table_fq`` by set membership against it (#340 family / #687 / #692).
@@ -884,14 +888,144 @@ class DatabricksDestination(BaseSqlDestination):
                 f"MERGE INTO {table_fq} AS t USING {keys_table} AS s "
                 f"ON {on_clause} {clause}{extra} THEN DELETE"
             )
-        # No params arg at all when unscoped — byte-identical to the
-        # pre-#692 call shape (existing tests assert the anti-join binds no
-        # parameters), not just an empty list.
-        if scope_params:
-            cur.execute(delete_sql, scope_params)
-        else:
-            cur.execute(delete_sql)
+        guarded = guard_options is not None and self._delete_guards_enabled(guard_options)
+        try:
+            counted = 0
+            baseline: int | None = None
+            if guarded:
+                assert guard_options is not None
+                limits = guard_options.guards
+                if guard_baseline == "table" and (limits is None or limits.max_delete_pct is None):
+                    guard_baseline = None  # only a percentage needs the denominator
+                counted, baseline = self._count_guarded_delete(
+                    cur,
+                    table_fq,
+                    upsert_cols,
+                    keys_table,
+                    scope_cols,
+                    scopes,
+                    scope_params,
+                    _scope_cond,
+                    negate,
+                    guard_baseline,
+                )
+                # Nothing has been deleted yet: a refusal here is a clean stop.
+                self._enforce_delete_guards(guard_options, deletes=counted, baseline=baseline)
+            # No params arg at all when unscoped — byte-identical to the
+            # pre-#692 call shape (existing tests assert the anti-join binds no
+            # parameters), not just an empty list.
+            if scope_params:
+                cur.execute(delete_sql, scope_params)
+            else:
+                cur.execute(delete_sql)
+            if guarded:
+                assert guard_options is not None
+                self._verify_deleted_rows(cur, guard_options, counted, baseline)
+        except BaseException:
+            # Best effort: cleanup must never replace the guard refusal.
+            try:
+                cur.execute(f"DROP TABLE IF EXISTS {keys_table}")
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         cur.execute(f"DROP TABLE IF EXISTS {keys_table}")
+
+    # --- run-time delete guards (#1218 part 2) ----------------------------
+    def _supports_runtime_delete_guards(self) -> bool:
+        return True
+
+    def _count_guarded_delete(
+        self,
+        cur: Any,
+        table_fq: str,
+        upsert_cols: list[str],
+        keys_table: str,
+        scope_cols: list[str] | None,
+        scopes: list[tuple[Any, ...]] | None,
+        scope_params: list[Any],
+        scope_cond: Any,
+        negate: bool,
+        guard_baseline: int | None | Literal["table"],
+    ) -> tuple[int, int | None]:
+        """Count the rows the staged DELETE/MERGE is about to remove.
+
+        Delta cannot roll a DELETE back, so the decision is made on this
+        ``COUNT(*)`` over the *same* predicate (and re-checked against the
+        statement's own result afterwards, see :meth:`_verify_deleted_rows`).
+        """
+        key_cols = ", ".join(upsert_cols)
+        scoped = bool(scope_cols and scopes)
+        if len(upsert_cols) == 1:
+            op = "NOT IN" if negate else "IN"
+            scope_sql = f"{scope_cond('')} AND " if scoped else ""
+            count_sql = (
+                f"SELECT COUNT(*) FROM {table_fq} WHERE {scope_sql}{upsert_cols[0]} "
+                f"{op} (SELECT {key_cols} FROM {keys_table})"
+            )
+        else:
+            join = " AND ".join(f"t.{c} = s.{c}" for c in upsert_cols)
+            exists = "NOT EXISTS" if negate else "EXISTS"
+            scope_sql = f"{scope_cond('t.')} AND " if scoped else ""
+            count_sql = (
+                f"SELECT COUNT(*) FROM {table_fq} AS t WHERE {scope_sql}"
+                f"{exists} (SELECT 1 FROM {keys_table} AS s WHERE {join})"
+            )
+        cur.execute(count_sql, scope_params) if scope_params else cur.execute(count_sql)
+        counted = int(cur.fetchone()[0])
+
+        baseline: int | None
+        if guard_baseline == "table":
+            if scoped:
+                cur.execute(f"SELECT COUNT(*) FROM {table_fq} WHERE {scope_cond('')}", scope_params)
+            else:
+                cur.execute(f"SELECT COUNT(*) FROM {table_fq}")
+            baseline = int(cur.fetchone()[0])
+        else:
+            baseline = guard_baseline
+        return counted, baseline
+
+    def _verify_deleted_rows(
+        self,
+        cur: Any,
+        sync_options: SyncOptions,
+        counted: int,
+        baseline: int | None,
+    ) -> None:
+        """Re-judge the statement's own row count; the DELETE already committed."""
+        verify_committed_delete(
+            sync_options, counted=counted, actual=self._deleted_rows(cur), baseline=baseline
+        )
+
+    @staticmethod
+    def _deleted_rows(cur: Any) -> int | None:
+        """Rows removed, from Delta's DML result row; ``None`` when unreadable."""
+        try:
+            row = cur.fetchone()
+            description = cur.description
+        except Exception:  # noqa: BLE001 — unreadable means unverified, handled by the caller
+            return None
+        if row is None or not description:
+            return None
+        names = [str(d[0]).lower() for d in description]
+        for name in ("num_deleted_rows", "num_affected_rows"):
+            if name in names:
+                value = row[names.index(name)]
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    return value
+        return None
+
+    def _build_table_count(self, table: str) -> str:
+        return f"SELECT COUNT(*) FROM {table}"
+
+    def _build_swap_delete_count(self, table: str, shadow: str, upsert_cols: list[str]) -> str:
+        equality = " AND ".join(f"l.{c} <=> s.{c}" for c in upsert_cols)
+        return (
+            f"SELECT COUNT(*) FROM {table} AS l "
+            f"WHERE NOT EXISTS (SELECT 1 FROM {shadow} AS s WHERE {equality})"
+        )
+
+    def _build_drop_table(self, table: str) -> str:
+        return f"DROP TABLE IF EXISTS {table}"
 
     def _finalize_mirror(
         self,
@@ -946,10 +1080,19 @@ class DatabricksDestination(BaseSqlDestination):
         try:
             with tagged_cursor(conn.cursor(), sync_options) as cur:
                 self._delete_via_staged_keys(
-                    cur, table_fq, upsert_cols, keys, keys_table, scope_cols, scopes, negate=True
+                    cur,
+                    table_fq,
+                    upsert_cols,
+                    keys,
+                    keys_table,
+                    scope_cols,
+                    scopes,
+                    negate=True,
+                    guard_options=sync_options,
+                    guard_baseline="table",
                 )
         finally:
-            conn.close()
+            run_cleanup_preserving_guard(conn.close)
 
         return SyncResult()
 
@@ -991,9 +1134,11 @@ class DatabricksDestination(BaseSqlDestination):
                     None,
                     None,
                     negate=False,
+                    guard_options=sync_options,
+                    guard_baseline=None,
                 )
         finally:
-            conn.close()
+            run_cleanup_preserving_guard(conn.close)
 
         return SyncResult()
 
@@ -1204,6 +1349,59 @@ class DatabricksDestination(BaseSqlDestination):
                 else:
                     to_delete = [decode_key(kj) for _h, kj in raw_diff]
 
+                tracked_baseline: int | None = None
+                if (
+                    self._delete_guards_enabled(sync_options)
+                    and to_delete
+                    and sync_options.guards is not None
+                    and sync_options.guards.max_delete_pct is not None
+                ):
+                    # Exact only when no legacy (scope-unknown) rows inflate it
+                    # and the scope columns exist; otherwise a percentage guard
+                    # fails closed rather than dividing by a wrong denominator.
+                    if scope_positions is None or (scope_sql and not stale_scope):
+                        baseline_sql = f"SELECT COUNT(*) FROM {state_fq} s WHERE s.sync_name = ?"
+                        baseline_params: list[Any] = [sync_name]
+                        if scope_sql and observed_scopes:
+                            baseline_sql += (
+                                " AND (s.scope_key IS NULL OR s.scope_spec <> ? "
+                                f"OR s.scope_key IN ({placeholders}))"
+                            )
+                            baseline_params = [sync_name, scope_spec, *observed_json]
+                        cur.execute(baseline_sql, baseline_params)
+                        tracked_baseline = int(cur.fetchone()[0])
+
+                if to_delete:
+                    try:
+                        self._delete_via_staged_keys(
+                            cur,
+                            table_fq,
+                            upsert_cols,
+                            to_delete,
+                            keys_table,
+                            None,
+                            None,
+                            negate=False,
+                            guard_options=sync_options,
+                            guard_baseline=tracked_baseline,
+                        )
+                    except GuardTripped:
+                        try:
+                            cur.execute(f"DROP TABLE IF EXISTS {diff_table}")
+                        except Exception:  # noqa: BLE001 — never mask the refusal
+                            pass
+                        raise
+                elif not previous_exists:
+                    logging.getLogger(__name__).warning(
+                        "tracked mirror: no prior state for sync %r in %s — "
+                        "baselining this run's %d key(s); no deletes this run.",
+                        sync_name,
+                        STATE_TABLE,
+                        len(current),
+                    )
+
+                # The backfill runs only after the delete guard has passed: a refused
+                # run must leave the tracked state exactly as it found it.
                 # #890 backfill — see the Postgres/MySQL leg for why. Delta takes
                 # a plain UPDATE, so the "rows are already in hand" cost argument
                 # holds here as it does on Postgres/MySQL/Snowflake (unlike
@@ -1225,26 +1423,6 @@ class DatabricksDestination(BaseSqlDestination):
                                 h,
                             ],
                         )
-
-                if to_delete:
-                    self._delete_via_staged_keys(
-                        cur,
-                        table_fq,
-                        upsert_cols,
-                        to_delete,
-                        keys_table,
-                        None,
-                        None,
-                        negate=False,
-                    )
-                elif not previous_exists:
-                    logging.getLogger(__name__).warning(
-                        "tracked mirror: no prior state for sync %r in %s — "
-                        "baselining this run's %d key(s); no deletes this run.",
-                        sync_name,
-                        STATE_TABLE,
-                        len(current),
-                    )
 
                 if to_delete:
                     delete_prefix = f"DELETE FROM {state_fq} WHERE sync_name = ? AND key_hash IN ("
@@ -1297,7 +1475,7 @@ class DatabricksDestination(BaseSqlDestination):
 
                 cur.execute(f"DROP TABLE IF EXISTS {diff_table}")
         finally:
-            conn.close()
+            run_cleanup_preserving_guard(conn.close)
 
         return SyncResult()
 

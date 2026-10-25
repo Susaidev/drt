@@ -158,6 +158,10 @@ class _RunContext:
     reviewed_forced_guards: set[str] | None = None
     reviewed_guard_deletes: int | None = None
     reviewed_guard_baseline: int | None = None
+    # Plan/apply lineage (#1222): set only by ``drt apply``, recorded on the
+    # history entry. Ordinary ``drt run`` leaves both unset.
+    plan_id: str | None = None
+    approved_by: str | None = None
     # Where the project lives. ``drt run`` is always invoked from it; the MCP
     # server may not be, so ``drt apply`` passes it explicitly.
     project_dir: Path = Path(".")
@@ -264,6 +268,8 @@ def _run_one(
                 reviewed_forced_guards=ctx.reviewed_forced_guards,
                 reviewed_guard_deletes=ctx.reviewed_guard_deletes,
                 reviewed_guard_baseline=ctx.reviewed_guard_baseline,
+                plan_id=ctx.plan_id,
+                approved_by=ctx.approved_by,
             )
         except Exception as e:
             from drt.cli.errors import format_error, render_to_console
@@ -298,13 +304,10 @@ def _run_one(
                 # re-raising still carry the correct one.
                 "run_id": ctx.run_id,
             }
-            from drt.engine.guards import GuardTripped
+            from drt.engine.guards import GuardTripped, guards_outcome_of
 
             if isinstance(e, GuardTripped):
-                entry["guards"] = {
-                    "tripped": [trip.to_dict() for trip in e.trips],
-                    "forced": False,
-                }
+                entry["guards"] = guards_outcome_of(e)
             else:
                 forced_outcome = getattr(e, "_drt_guards", None)
                 if forced_outcome is not None:
